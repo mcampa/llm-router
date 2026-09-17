@@ -3,8 +3,10 @@ model_list:
   - model_name: local
     litellm_params:
       model: hosted_vllm/qwen3.8-flash-next
-      # compose service name - resolved on the bridge, no host hop
-      api_base: http://vllm:8000
+      # compose service name - resolved on the bridge, no host hop.
+      # /v1 IS required: the hosted_vllm provider appends the path verbatim
+      # (litellm POSTs to {api_base}/chat/completions), so without it vLLM 404s.
+      api_base: http://vllm:8000/v1
       # no api_key: the vLLM server has auth disabled
 
   # "deepseek" -> DeepSeek cloud API

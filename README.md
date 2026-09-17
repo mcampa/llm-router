@@ -74,7 +74,7 @@ Fill in:
 docker compose up -d
 ```
 
-`litellm`, `db` and `redis` come up in seconds. **`vllm` takes 10–13 minutes** to load
+`litellm`, `db` and `redis` come up in seconds. **`vllm` takes 10–16 minutes** to load
 weights — it will sit unhealthy until then. See [Operations](#operations).
 
 ## systemd
@@ -216,9 +216,9 @@ it per-model if that is not what you want.
 
 ### `deepseek-flash`
 
-The upstream model id `deepseek-flash` is not documented on DeepSeek's public API, which
-exposes `deepseek-chat` and `deepseek-reasoner`. If the `deepseek` route returns a 400
-about an unknown model, that is why — change one line in `config.yaml`:
+Verified working against the live API. The id is not in DeepSeek's public documentation
+(which lists `deepseek-chat` and `deepseek-reasoner`), so it may be account-gated or new.
+If it ever starts returning a 400 about an unknown model, change one line in `config.yaml`:
 
 ```yaml
 model: deepseek/deepseek-chat
@@ -233,4 +233,6 @@ model: deepseek/deepseek-chat
 | `deepseek` route 401s | `DEEPSEEK_API_KEY` placeholder in `.env`; the key is read at proxy startup, so restart `litellm` after editing |
 | `docker compose pull` fails on `vllm` | the image is local-only by design |
 | vLLM container exits with `EADDRINUSE` | another server holds port 8000 |
+| `local` returns 429 "No deployments available" | a previous call 404'd and put the deployment in cooldown. Check `api_base` ends in `/v1` — the provider appends the path verbatim and vLLM 404s without it |
+| `local` returns 404 from vLLM | same cause as above |
 | Repeated cached answers | global `cache: true`; see [Caching](#caching) |
