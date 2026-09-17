@@ -3,7 +3,8 @@ model_list:
   - model_name: local
     litellm_params:
       model: hosted_vllm/qwen3.8-flash-next
-      api_base: http://host.docker.internal:8000
+      # compose service name - resolved on the bridge, no host hop
+      api_base: http://vllm:8000
       # no api_key: the vLLM server has auth disabled
 
   # "deepseek" -> DeepSeek cloud API

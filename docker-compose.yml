@@ -11,9 +11,6 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
-    extra_hosts:
-      # lets the container reach vLLM running on this host's :8000
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000"]
@@ -54,10 +51,15 @@ services:
   vllm:
     image: qwen38-flash-dgx:nvfp4
     container_name: vllm-qwen38-flash
-    # Host networking, matching how it runs under sparkrun. vLLM binds :8000 on the
-    # host directly, so there is no `ports:` here and no service-name DNS - litellm
-    # reaches it via host.docker.internal:8000.
-    network_mode: host
+    # On the compose bridge, deliberately NOT host networking. vLLM still passes
+    # --host 0.0.0.0, but inside a container that binds this container's own network
+    # namespace, not the host's - so it is not LAN-reachable. The only ways in are
+    # the loopback-bound port below and the compose network.
+    ports:
+      # The 127.0.0.1 prefix is load-bearing: keeps the port off every other
+      # interface while leaving host-side tooling (bench_qwen38_flash.py,
+      # healthcheck_qwen38_flash.sh) working against 127.0.0.1:8000.
+      - "127.0.0.1:8000:8000"
     ipc: host
     shm_size: 32gb
     ulimits:
@@ -80,6 +82,9 @@ services:
       # The recipe's @mcampa/fix-qwen3.8-flash-chat-template mod; this file differs
       # from the one inside the checkpoint snapshot, so it must win.
       - ./chat_template.jinja:/workspace/vllm/chat_template.jinja:ro
+      # The serve command. Read-only, and invoked via /bin/bash so the exec bit
+      # and bind-mount ownership don't matter.
+      - ./vllm-start.sh:/workspace/vllm-start.sh:ro
     environment:
       # --- PLE n-gram table mmapped from NVMe (the reason this fits one Spark) ---
       VLLM_PLE_MMAP: "1"
@@ -107,44 +112,10 @@ services:
       HF_HUB_CACHE: /cache/huggingface/hub
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
-    # NOTE: list form, not a string. The image entrypoint is ["vllm","serve"], and a
-    # string command would be wrapped in `sh -c` and appended to it.
-    command:
-      - nvidia/Qwen3.8-Flash-Next-NVFP4
-      - --served-model-name
-      - qwen3.8-flash-next
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-      - --tensor-parallel-size
-      - "1"
-      - --load-format
-      - safetensors
-      - --max-model-len
-      - "262144"
-      - --max-num-seqs
-      - "8"
-      - --gpu-memory-utilization
-      - "0.8"
-      - --enable-prefix-caching
-      - --enable-chunked-prefill
-      - --max-num-batched-tokens
-      - "8192"
-      - "-cc.cudagraph_mode=PIECEWISE"
-      - '-cc.splitting_ops=["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]'
-      - --no-enable-flashinfer-autotune
-      - --kv-cache-dtype
-      - auto
-      - --enable-auto-tool-choice
-      - --tool-call-parser
-      - qwen3_coder
-      - --reasoning-parser
-      - qwen3
-      - --chat-template
-      - /workspace/vllm/chat_template.jinja
-      - --speculative-config
-      - '{"method":"mtp","num_speculative_tokens":2}'
+    # Replaces the image's ENTRYPOINT ["vllm","serve"] instead of appending to
+    # it. A script cannot go in `command:` - that entrypoint would prepend itself
+    # and yield argv "vllm serve /workspace/vllm-start.sh". See vllm-start.sh.
+    entrypoint: ["/bin/bash", "/workspace/vllm-start.sh"]
     healthcheck:
       # /health 200s only once weights are loaded - ~10-13 min cold.
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]

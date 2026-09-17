@@ -1,0 +1,21 @@
+[Unit]
+Description=LiteLLM router stack (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=mcampa
+Group=mcampa
+# Every bind mount in docker-compose.yml is relative, so this must be the repo root.
+WorkingDirectory=/home/mcampa/llm-router
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+# `compose up -d` returns once containers are *created*, not healthy - it does not
+# block boot for the ~10-13 min vLLM weight load. Do not add --wait.
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
