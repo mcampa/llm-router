@@ -1,0 +1,7 @@
+# Secrets - never commit
+.env
+
+# Local overrides / editor noise
+docker-compose.override.yml
+*.swp
+.DS_Store

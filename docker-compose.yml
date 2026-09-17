@@ -1,0 +1,158 @@
+services:
+  litellm:
+    image: docker.litellm.ai/berriai/litellm:latest
+    ports:
+      - "4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      DATABASE_URL: postgresql://litellm:litellm@db:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+    extra_hosts:
+      # lets the container reach vLLM running on this host's :8000
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+      POSTGRES_DB: litellm
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redis_data:/data
+
+  # Qwen3.8-Flash-Next-NVFP4 on the DGX Spark, lifted from sparkrun recipe
+  # ~/sparkrun-recipes/recipes/qwen3.8-flash-next-nvfp4.yaml.
+  # Local-only image (not on a registry) - never pulled.
+  vllm:
+    image: qwen38-flash-dgx:nvfp4
+    container_name: vllm-qwen38-flash
+    # Host networking, matching how it runs under sparkrun. vLLM binds :8000 on the
+    # host directly, so there is no `ports:` here and no service-name DNS - litellm
+    # reaches it via host.docker.internal:8000.
+    network_mode: host
+    ipc: host
+    shm_size: 32gb
+    ulimits:
+      memlock: -1
+      nofile: 65535
+      stack: 67108864
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+      - /home/mcampa/.cache/huggingface:/cache/huggingface
+      # The recipe's @mcampa/fix-qwen3.8-flash-chat-template mod; this file differs
+      # from the one inside the checkpoint snapshot, so it must win.
+      - ./chat_template.jinja:/workspace/vllm/chat_template.jinja:ro
+    environment:
+      # --- PLE n-gram table mmapped from NVMe (the reason this fits one Spark) ---
+      VLLM_PLE_MMAP: "1"
+      VLLM_PLE_MMAP_WORKERS: "32"
+      VLLM_PLE_MMAP_PREWARM: "0"
+      VLLM_PLE_MMAP_MADVISE: random
+      # --- hybrid NVFP4 experts + blockwise-fp8 side layers ---
+      VLLM_FP8_HYBRID: "1"
+      VLLM_USE_DEEP_GEMM: "0"
+      VLLM_FP8_PAD_M4: "0"
+      # --- deterministic QSA top-k (stock persistent_topk drops candidates on GB10) ---
+      VLLM_QSA_DET_TOPK: "1"
+      VLLM_QSA_DET_LIB: /opt/llm/kernel-det/_C_det.so
+      VLLM_QSA_EXACT_TOPK: "0"
+      # --- reduced MTP draft vocab ---
+      VLLM_MTP_DRAFT_VOCAB: /opt/llm/draft_vocab_65536.npy
+      VLLM_USE_FLASHINFER_SAMPLER: "1"
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+      VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "600"
+      CUTE_DSL_ARCH: sm_121a
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # --- offline HF cache: weights live in the bind mount above ---
+      HOME: /tmp
+      HF_HOME: /cache/huggingface
+      HF_HUB_CACHE: /cache/huggingface/hub
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    # NOTE: list form, not a string. The image entrypoint is ["vllm","serve"], and a
+    # string command would be wrapped in `sh -c` and appended to it.
+    command:
+      - nvidia/Qwen3.8-Flash-Next-NVFP4
+      - --served-model-name
+      - qwen3.8-flash-next
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tensor-parallel-size
+      - "1"
+      - --load-format
+      - safetensors
+      - --max-model-len
+      - "262144"
+      - --max-num-seqs
+      - "8"
+      - --gpu-memory-utilization
+      - "0.8"
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --max-num-batched-tokens
+      - "8192"
+      - "-cc.cudagraph_mode=PIECEWISE"
+      - '-cc.splitting_ops=["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]'
+      - --no-enable-flashinfer-autotune
+      - --kv-cache-dtype
+      - auto
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --reasoning-parser
+      - qwen3
+      - --chat-template
+      - /workspace/vllm/chat_template.jinja
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":2}'
+    healthcheck:
+      # /health 200s only once weights are loaded - ~10-13 min cold.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 1200s
+
+volumes:
+  postgres_data:
+  redis_data:

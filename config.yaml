@@ -1,0 +1,25 @@
+model_list:
+  # "local" -> self-hosted vLLM on the Docker host, port 8000
+  - model_name: local
+    litellm_params:
+      model: hosted_vllm/qwen3.8-flash-next
+      api_base: http://host.docker.internal:8000
+      # no api_key: the vLLM server has auth disabled
+
+  # "deepseek" -> DeepSeek cloud API
+  - model_name: deepseek
+    litellm_params:
+      model: deepseek/deepseek-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+litellm_settings:
+  cache: true
+  cache_params:
+    type: redis
+    host: os.environ/REDIS_HOST
+    port: 6379
+    ttl: 600
+
+router_settings:
+  redis_host: os.environ/REDIS_HOST
+  redis_port: os.environ/REDIS_PORT
