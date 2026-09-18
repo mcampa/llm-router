@@ -23,10 +23,16 @@ Only `litellm` is exposed. `db` and `redis` publish no host ports, and `vllm` bi
 | Request `model` | Resolves to | Where |
 |---|---|---|
 | `local` | `qwen3.8-flash-next` | self-hosted vLLM, over the compose network |
-| `deepseek` | `deepseek-flash` | DeepSeek cloud API |
+| `deepseek` | `deepseek-flash`, then `local` | DeepSeek cloud API; falls back to vLLM |
 
 Both are defined in `config.yaml` as `model_name` aliases. Callers only ever name the
 alias; the upstream model id is an implementation detail.
+
+`deepseek` has a LiteLLM model-group fallback to `local`. If the cloud key is out of
+balance, times out, or returns 5xx, the proxy retries on vLLM and the client still
+sees `model: deepseek`. After one failure the cloud deployment is cooled down for
+300s so later turns skip the dead round trip. Restart `litellm` after editing
+`config.yaml` (`docker compose restart litellm`).
 
 ## Files
 
@@ -231,6 +237,8 @@ model: deepseek/deepseek-chat
 | `vllm` unhealthy for ~13 min | weight loading. Check `docker compose logs -f vllm` |
 | `local` route 502s, `deepseek` works | vLLM still loading, or failed — check its logs |
 | `deepseek` route 401s | `DEEPSEEK_API_KEY` placeholder in `.env`; the key is read at proxy startup, so restart `litellm` after editing |
+| `deepseek` fails with `Available Model Group Fallbacks=None` | `router_settings.fallbacks` missing or litellm not restarted after the config change |
+| `deepseek` still 400s after fallbacks land | LiteLLM treated a 400 as non-retryable; request `local` directly until the DeepSeek balance is topped up |
 | `docker compose pull` fails on `vllm` | the image is local-only by design |
 | vLLM container exits with `EADDRINUSE` | another server holds port 8000 |
 | `local` returns 429 "No deployments available" | a previous call 404'd and put the deployment in cooldown. Check `api_base` ends in `/v1` — the provider appends the path verbatim and vLLM 404s without it |

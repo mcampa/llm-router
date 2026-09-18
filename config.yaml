@@ -26,3 +26,12 @@ litellm_settings:
 router_settings:
   redis_host: os.environ/REDIS_HOST
   redis_port: os.environ/REDIS_PORT
+  # When DeepSeek cloud fails (insufficient balance, 5xx, timeout), retry on
+  # the self-hosted vLLM alias. Callers still request model "deepseek".
+  fallbacks:
+    - deepseek: [local]
+  # One billing 400 is enough to mark the cloud deployment unhealthy so later
+  # turns skip it for cooldown_time instead of paying the DeepSeek round trip
+  # on every request until the balance is topped up.
+  allowed_fails: 1
+  cooldown_time: 300
