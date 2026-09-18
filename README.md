@@ -34,6 +34,10 @@ sees `model: deepseek`. After one failure the cloud deployment is cooled down fo
 300s so later turns skip the dead round trip. Restart `litellm` after editing
 `config.yaml` (`docker compose restart litellm`).
 
+The Admin UI play button on Router Settings → Fallbacks sends `mock_testing_fallbacks`.
+That param is gated; `general_settings.dangerously_allow_mock_testing_request_params`
+must be true in `config.yaml` (it cannot be flipped from the UI).
+
 ## Files
 
 | File | Purpose |
@@ -239,6 +243,7 @@ model: deepseek/deepseek-chat
 | `deepseek` route 401s | `DEEPSEEK_API_KEY` placeholder in `.env`; the key is read at proxy startup, so restart `litellm` after editing |
 | `deepseek` fails with `Available Model Group Fallbacks=None` | `router_settings.fallbacks` missing or litellm not restarted after the config change |
 | `deepseek` still 400s after fallbacks land | LiteLLM treated a 400 as non-retryable; request `local` directly until the DeepSeek balance is topped up |
+| UI play button: `mock_testing_fallbacks` disabled | set `general_settings.dangerously_allow_mock_testing_request_params: true` and restart litellm |
 | `docker compose pull` fails on `vllm` | the image is local-only by design |
 | vLLM container exits with `EADDRINUSE` | another server holds port 8000 |
 | `local` returns 429 "No deployments available" | a previous call 404'd and put the deployment in cooldown. Check `api_base` ends in `/v1` — the provider appends the path verbatim and vLLM 404s without it |

@@ -15,6 +15,12 @@ model_list:
       model: deepseek/deepseek-flash
       api_key: os.environ/DEEPSEEK_API_KEY
 
+# The Admin UI Fallbacks "play" button sends mock_testing_fallbacks. Without
+# this, that request 400s. Any caller with a valid key can then inject synthetic
+# failures; this proxy is LAN-only behind LITELLM_MASTER_KEY.
+general_settings:
+  dangerously_allow_mock_testing_request_params: true
+
 litellm_settings:
   cache: true
   cache_params:
