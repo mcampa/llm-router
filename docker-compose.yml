@@ -1,6 +1,7 @@
 services:
   litellm:
     image: docker.litellm.ai/berriai/litellm:latest
+    restart: always
     ports:
       - "4000:4000"
     environment:
@@ -22,6 +23,7 @@ services:
 
   db:
     image: postgres:16
+    restart: always
     environment:
       POSTGRES_USER: litellm
       POSTGRES_PASSWORD: litellm
@@ -36,6 +38,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: always
     command: ["redis-server", "--appendonly", "yes"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -50,6 +53,7 @@ services:
   # Local-only image (not on a registry) - never pulled.
   vllm:
     image: qwen38-flash-dgx:nvfp4
+    restart: always
     container_name: vllm-qwen38-flash
     # On the compose bridge, deliberately NOT host networking. vLLM still passes
     # --host 0.0.0.0, but inside a container that binds this container's own network
