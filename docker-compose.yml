@@ -55,15 +55,17 @@ services:
     image: qwen38-flash-dgx:nvfp4
     restart: always
     container_name: vllm-qwen38-flash
-    # On the compose bridge, deliberately NOT host networking. vLLM still passes
-    # --host 0.0.0.0, but inside a container that binds this container's own network
-    # namespace, not the host's - so it is not LAN-reachable. The only ways in are
-    # the loopback-bound port below and the compose network.
+    # On the compose bridge, deliberately NOT host networking. vLLM passes
+    # --host 0.0.0.0 inside its own network namespace; the published port below
+    # is what controls host/LAN reachability.
     ports:
-      # The 127.0.0.1 prefix is load-bearing: keeps the port off every other
-      # interface while leaving host-side tooling (bench_qwen38_flash.py,
-      # healthcheck_qwen38_flash.sh) working against 127.0.0.1:8000.
+      # Loopback mapping preserved so host-side tooling (bench_qwen38_flash.py,
+      # healthcheck_qwen38_flash.sh) keeps working against 127.0.0.1:8000.
       - "127.0.0.1:8000:8000"
+      # LAN mapping so Prometheus on 192.168.0.40 can scrape /metrics. NOTE: this
+      # also exposes the full OpenAI API (chat/completions, etc.) to the LAN - a
+      # deliberate trade-off chosen over a metrics-only reverse proxy.
+      - "192.168.0.96:8000:8000"
     ipc: host
     shm_size: 32gb
     ulimits:
@@ -127,6 +129,69 @@ services:
       timeout: 10s
       retries: 3
       start_period: 1200s
+
+  # --- Observability sidecars: scraped by Prometheus on 192.168.0.40 ---
+
+  # GPU metrics (util, clocks, power, energy, temps, NVLink, PCIe, XID errors).
+  # Replaces the previously hand-run `docker run` container so compose owns it.
+  # DCP/profiling fields aren't loaded on GB10 - the default counter set works.
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+    restart: unless-stopped
+    container_name: dcgm-exporter
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      # LAN-reachable so Prometheus (192.168.0.40) can scrape GPU metrics.
+      - "9400:9400"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Host resources for this box (gx10 / trantor): CPU, load, RAM (unified memory
+  # on GB10), swap, disk usage/IO, network, filesystem, uptime.
+  # Deliberately docker-published (NOT network_mode: host): the host has ufw
+  # active, and ufw filters the INPUT chain but not docker's FORWARD/DNAT chains.
+  # A host-networked bind on 9100 is dropped by ufw for LAN clients, whereas a
+  # docker-published port is reachable from Prometheus (192.168.0.40) - the same
+  # path the dcgm-exporter sidecar uses successfully.
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    container_name: node-exporter
+    pid: host
+    # disable-defaults + an explicit allowlist: several default collectors
+    # (hwmon, thermal_zone, powersupplyclass, rapl, nvme, mdadm, edac) block on
+    # exotic hardware sysfs on the GB10/Grace-Blackwell platform and intermittently
+    # hang the whole /metrics handler. This curated set covers CPU/mem/disk/net/fs
+    # and always scrapes in <20ms. GPU temp/power/util come from dcgm-exporter.
+    command:
+      - "--path.rootfs=/host"
+      - "--collector.disable-defaults"
+      - "--collector.cpu"
+      - "--collector.loadavg"
+      - "--collector.meminfo"
+      - "--collector.vmstat"
+      - "--collector.stat"
+      - "--collector.filesystem"
+      - "--collector.diskstats"
+      - "--collector.netdev"
+      - "--collector.netstat"
+      - "--collector.sockstat"
+      - "--collector.uname"
+      - "--collector.os"
+      - "--collector.time"
+      - "--collector.filefd"
+      - "--collector.pressure"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    ports:
+      - "9100:9100"
+    volumes:
+      - /:/host:ro,rslave
 
 volumes:
   postgres_data:

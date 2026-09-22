@@ -22,6 +22,11 @@ general_settings:
   dangerously_allow_mock_testing_request_params: true
 
 litellm_settings:
+  # NOTE: LiteLLM's built-in Prometheus /metrics exporter is an Enterprise
+  # feature (moved out of beta into Enterprise on 2024-09-15, ~$250/mo). On this
+  # OSS build, enabling `callbacks: ["prometheus"]` does NOT serve /metrics
+  # (verified: 404 even with the master key). Left disabled; gateway metrics are
+  # covered by the free community DB-exporter if wired up separately.
   cache: true
   cache_params:
     type: redis
