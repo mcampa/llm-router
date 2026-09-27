@@ -1,3 +1,10 @@
+{#- Local patch over local-inference-lab/Qwen3.8-Flash-Next-NVFP4 chat_template.jinja
+    Merges consecutive *leading* system messages into one system prefix. OpenCode +
+    Hindsight emit two {{role:system}} blocks; the upstream template only ever consumed
+    messages[0] and then raised "System message must be at the beginning." on the second.
+    A request with a single leading system message renders byte-identically to upstream.
+    Nothing else is changed: tool calling, reasoning/thinking, special tokens and the
+    assistant generation prompt are upstream's. -#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
 {%- macro render_content(content, do_vision_count, is_system_content=false) %}
@@ -54,12 +61,9 @@
         {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
     {%- endif %}
 {%- endif %}
-{#- Merge consecutive leading system/developer messages into one prefix.
-    OpenCode + Hindsight emit two {role:system} blocks; NVIDIA's template
-    raised "System message must be at the beginning." on the second. -#}
 {%- set ns_sys = namespace(parts=[], count=0, leading=true) %}
 {%- for message in messages %}
-    {%- if ns_sys.leading and (message.role == "system" or message.role == "developer") %}
+    {%- if ns_sys.leading and message.role == "system" %}
         {%- set c = render_content(message.content, false, true)|trim %}
         {%- if c %}
             {%- set ns_sys.parts = ns_sys.parts + [c] %}
@@ -88,7 +92,7 @@
     {{- '<|im_end|>\n' }}
 {%- else %}
     {%- if system_prefix %}
-        {{- '<|im_start|>system\n' + (reasoning_instructions + '\n\n' if reasoning_instructions else '') + system_prefix + '<|im_end|>\n' }}
+        {{- '<|im_start|>system\n' + (reasoning_instructions + '\n\n' if reasoning_instructions else '')  + system_prefix + '<|im_end|>\n' }}
     {%- elif reasoning_instructions %}
         {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
     {%- endif %}
@@ -109,7 +113,7 @@
 {%- endif %}
 {%- for message in messages %}
     {%- set content = render_content(message.content, true)|trim %}
-    {%- if message.role == "system" or message.role == "developer" %}
+    {%- if message.role == "system" %}
         {%- if loop.index0 >= ns_sys.count %}
             {{- raise_exception('System message must be at the beginning.') }}
         {%- endif %}
