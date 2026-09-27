@@ -4,9 +4,10 @@ A local LLM gateway for the DGX Spark. One OpenAI-compatible endpoint on port `4
 that routes to a self-hosted vLLM model and to DeepSeek's cloud API, with Postgres-backed
 model storage and Redis-backed caching.
 
-The self-hosted side runs **Eugr's B12x vLLM stack** on one GB10, and can serve either of
-two Qwen3.8-Flash-Next checkpoints. `qwen38-fast` is enabled; `qwen38` (full NVFP4) is
-staged in `docker-compose.yml`, commented out.
+The self-hosted side runs on one GB10 and can serve any **one of three** Qwen3.8-Flash-Next
+backends. `qwen38-fast` (Eugr's B12x stack) is enabled; `qwen38` (full NVFP4, the same B12x
+stack) and `qwen38-hibrid48` (bilikaz's myllmbox v4 image, n-gram table demand-paged from
+local NVMe) are staged in `docker-compose.yml`, commented out.
 
 ## Architecture
 
@@ -27,46 +28,81 @@ comment in `docker-compose.yml` if you want to revisit it.
 
 ## Backends
 
-Both backends are the same Compose service name (`vllm`), on the same ports, serving the
-same `--served-model-name qwen3.8-flash-next`. LiteLLM reaches them at
-`http://vllm:8000/v1` either way, so **nothing outside `docker-compose.yml` changes when
-you switch** — not `config.yaml`, not the `local` alias, not any caller.
+All three are the same Compose service name (`vllm`), on the same ports, serving the same
+`--served-model-name qwen3.8-flash-next`. LiteLLM reaches them at `http://vllm:8000/v1`
+either way, so **nothing outside `docker-compose.yml` changes when you switch** — not
+`config.yaml`, not the `local` alias, not any caller. This is checked, not just asserted:
+the three switch positions render a byte-identical `litellm` service, and every startup
+script passes the same `--served-model-name`.
 
-| | `qwen38-fast` (enabled) | `qwen38` (commented out) |
-|---|---|---|
-| Checkpoint | `azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound` | `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` |
-| Quantisation | Intel AutoRound int4 + blockwise-fp8 side layers | NVIDIA ModelOpt NVFP4 (`modelopt_mixed`) |
-| Shape | 125B total, ~5 of 10 routed experts per token | 125B total, 10 experts per token |
-| Weights on disk | ~119 GiB | ~124 GiB |
-| KV cache | pinned `20g` (`--kv-cache-memory-bytes`), ~645k tokens | sized from `--gpu-memory-utilization 0.8`, fp8 |
-| Decode (this box) | ~33% faster than the full model | baseline |
-| Deterministic at T=0 | no | yes |
-| Startup script | `vllm-start-fast.sh` | `vllm-start-full.sh` |
-| Extra pieces | the vendored `mods/flashnext-int4-b12x/` | none |
+| | `qwen38-fast` (enabled) | `qwen38` (commented out) | `qwen38-hibrid48` (commented out) |
+|---|---|---|---|
+| Checkpoint | `azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound` | `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` | `myllmbox/Qwen3.8-Flash-Next-hibrid48` |
+| Image | Eugr B12x (`eugr/spark-vllm-b12x`) | same Eugr B12x image | `myllmbox/qwen38-flash-next-vllm` v4 (vLLM 0.30) |
+| Quantisation | Intel AutoRound int4 + blockwise-fp8 side layers | NVIDIA ModelOpt NVFP4 (`modelopt_mixed`) | NVFP4 body + NVFP4 4-bit output head |
+| Shape | 125B total, ~5 of 10 routed experts per token | 125B total, 10 experts per token | 48 layers, 10 of 512 routed experts per token |
+| Weights on disk | ~119 GiB | ~124 GiB | ~98 GiB |
+| PLE / n-gram table | streamed from disk (`VLLM_PLE_TABLE_MEMORY=disk`) | streamed from disk (same) | demand-paged from **local NVMe** by the image's own reader |
+| KV cache | pinned `20g` (`--kv-cache-memory-bytes`), ~645k tokens | sized from `--gpu-memory-utilization 0.8`, fp8 | pinned `26000000000` (`--kv-cache-memory-bytes`), bf16, ~800k tokens |
+| Concurrency | `--max-num-seqs 8` | `--max-num-seqs 8` | `--max-num-seqs 16` |
+| Draft / spec decode | MTP, K=4, greedy draft | MTP, K=4 | MTP, K=5, sampled (`probabilistic`) draft |
+| Deterministic at T=0 | no | yes | no (K=5 drafts are sampled) |
+| RDMA | no (RoCE env is inert on one box) | no | no |
+| Startup script | `vllm-start-fast.sh` | `vllm-start-full.sh` | `vllm-start-hibrid48.sh` |
+| Chat template | `qwen38-fast-medium.jinja` | `qwen38-full.jinja` | `qwen38-hibrid48.jinja` |
+| Extra pieces | the vendored `mods/flashnext-int4-b12x/` | none | a ~31 GB table map under `/cache`, built on first boot |
+| Decode on this box | baseline (~33% faster than the full NVFP4 model) | not measured | **not measured — see the smoke test** |
 
-Only one may run at a time — they would fight for the GPU and port 8000.
+Only one may run at a time: they would fight for the GPU and port 8000, and the box has
+unified memory for one of them, not two.
+
+On the `qwen38-hibrid48` row: the checkpoint reports 48 layers and 10 of 512 routed experts
+per token, which is the same 125B-A6B body as `qwen38` — but the shipped kit measures
+**180.0B counted parameters at 4.35 bpw effective** for it. The extra ~51B is the n-gram
+table (320,001,536 rows × 160, itself NVFP4), which is why the weights are ~98 GiB rather
+than the ~124 GiB the body alone would suggest, and why the table is the thing this backend
+moves to NVMe. Do not quote a parameter count for this checkpoint from the table alone.
 
 > `qwen38` uses `local-inference-lab/…`, **not** the `nvidia/Qwen3.8-Flash-Next-NVFP4`
 > checkpoint. No current B12x recipe targets the `nvidia` layout; Eugr's recipe serves the
 > 2026-09-16 re-export, which is what `--load-format b12x` and `--quantization
 > modelopt_mixed` expect. If you have `nvidia/…` in your cache from the old stack, it will
 > not be reused.
+>
+> The same applies to `qwen38-hibrid48`: it needs its own `myllmbox/…` download. Neither
+> B12x checkpoint can be served by this image, and this checkpoint cannot be served by the
+> B12x image — `vllm-start-hibrid48.sh` checks for the `ple_quantization` marker in
+> `config.json` and refuses to start on anything else.
 
-### Switching to the full NVFP4 model
+### Switching between backends
+
+The three blocks live in `docker-compose.yml` under the banner comment above them, one
+live and two commented. Switching is: comment out the live one, uncomment the one you
+want, recreate. Reversing it switches back — the change is three lines of comment markers,
+so `git checkout docker-compose.yml` is the always-available undo.
 
 ```bash
-# 1. In docker-compose.yml: comment out the "ACTIVE: qwen38-fast" service and
-#    delete the leading '#' from the "ALTERNATIVE: qwen38" block.
-# 2. Make sure its checkpoint is cached (see Prerequisites).
+# 1. In docker-compose.yml: comment out the live "ACTIVE: qwen38-fast" block, and delete
+#    the leading '#' from whichever "ALTERNATIVE" block you want.
+# 2. Make sure that backend's checkpoint is in place (see Prerequisites).
 # 3. Recreate the backend:
 docker compose up -d --remove-orphans
 
-# back to fast: reverse step 1 and re-run the same command
+# Roll back: restore the comment markers (or `git checkout docker-compose.yml`) and re-run
+# the same command.
 ```
 
-Both blocks use `container_name: vllm-qwen38-flash`, so the switch is a plain recreate —
+Check the result before you commit to it — this parses the file without starting anything:
+
+```bash
+docker compose config --services          # must list exactly one `vllm`
+docker compose config | grep -A2 '^  vllm'
+```
+
+All three blocks use `container_name: vllm-qwen38-flash`, so a switch is a plain recreate —
 no container-name conflicts, and host tooling that targets the container by name keeps
-working. Expect ~10–15 minutes of weight loading after either switch.
+working. Expect ~10–15 minutes of weight loading after a `qwen38-fast` / `qwen38` start, and
+about 4 minutes (plus a few minutes once, for the table map) after a `qwen38-hibrid48` start.
 
 ## Model routes
 
@@ -77,7 +113,7 @@ working. Expect ~10–15 minutes of weight loading after either switch.
 
 Both are defined in `config.yaml` as `model_name` aliases. Callers only ever name the
 alias. `local` is stable across a backend switch, and the upstream model id
-(`qwen3.8-flash-next`) is the same for both backends — that is why a switch needs no
+(`qwen3.8-flash-next`) is the same for all three backends — that is why a switch needs no
 config change.
 
 `deepseek` has a LiteLLM model-group fallback to `local`. If the cloud key is out of
@@ -94,10 +130,11 @@ be true in `config.yaml` (it cannot be flipped from the UI).
 
 | File | Purpose |
 |---|---|
-| `docker-compose.yml` | the services, and the two alternative `vllm` backends |
+| `docker-compose.yml` | the services, and the three alternative `vllm` backends |
 | `config.yaml` | model routing, Redis cache, router settings |
 | `vllm-start-fast.sh` | build the model views, patch vLLM, serve `qwen38-fast` |
 | `vllm-start-full.sh` | serve `qwen38` (used only when that block is enabled) |
+| `vllm-start-hibrid48.sh` | serve `qwen38-hibrid48` (used only when that block is enabled) |
 | `mods/flashnext-int4-b12x/` | vendored upstream mod: model views + vLLM patches for the A5B checkpoint |
 | `chat-templates/` | the checkpoints' own chat templates, with one local fix (below) |
 | `llm-router.service` | systemd unit (see below) |
@@ -126,21 +163,30 @@ Fill in:
 ### 2. Prerequisites
 
 - Docker with the NVIDIA container runtime (`docker info` should list `nvidia`)
-- ~1.6 TB free for the two checkpoints if you want both
+- ~1.7 TB free for the three checkpoints if you want all of them
 
-The vLLM image is pulled from Docker Hub by `docker compose up`. It is pinned by digest
-(not `latest`), because Eugr's `latest` has since moved and the newer build is not a
-drop-in for these checkpoints:
+#### Images
+
+Both images are pulled from Docker Hub by `docker compose up`. Each is pinned by digest
+(not a tag) because the upstream `latest` tags have moved since and the newer builds are
+not drop-ins for these checkpoints:
 
 ```
 eugr/spark-vllm-b12x@sha256:8e7e062186f841453ef0ec6f713043c5b65447decc3835206685128c18e42262
+    qwen38-fast, qwen38 - ~10.4 GiB compressed, ~31 GB on disk
+myllmbox/qwen38-flash-next-vllm@sha256:51629f438f5ba3f7a96db110826c783d69b91a6851c43fb07d447644f157dcc4
+    qwen38-hibrid48 - bilikaz's kit, v4 tag = vLLM 0.30 + the NVFP4 table/output-head patches
 ```
 
-~10.4 GiB compressed, ~31 GB on disk. To pre-pull it: `docker compose pull vllm`.
+Only the image for the backend you are running needs to be pulled. To pre-pull the live
+one: `docker compose pull vllm`. `docker compose config` prints the digest of whichever
+block is uncommented.
 
-The checkpoints live in the host HuggingFace cache at `~/.cache/huggingface`, mounted at
-`/cache/huggingface`. The `vllm` services run `HF_HUB_OFFLINE=1`, so nothing is fetched at
-runtime and a missing/incomplete snapshot fails fast at container start.
+#### Checkpoints
+
+`qwen38-fast` and `qwen38` read from the host HuggingFace cache at `~/.cache/huggingface`,
+mounted at `/cache/huggingface`. Those services run `HF_HUB_OFFLINE=1`, so nothing is
+fetched at runtime and a missing/incomplete snapshot fails fast at container start.
 
 ```bash
 # qwen38-fast - already cached on this box (~119 GiB)
@@ -153,6 +199,33 @@ hf download local-inference-lab/Qwen3.8-Flash-Next-NVFP4
 The A5B checkpoint ships its n-gram PLE table, an int4 lm_head, a healed shared-expert
 shard and its chat templates in the same snapshot; there is nothing else to fetch.
 
+`qwen38-hibrid48` is different: it is a plain `--local-dir` tree on the NVMe, **not** the
+shared HF cache (that is the layout bilikaz's kit uses, and the table reader expects it).
+It needs **~130 GB on the NVMe**: ~98 GiB of weights plus ~31 GB of table map.
+
+```bash
+# 1. ~130 GB on the NVMe. `/` is the NVMe volume on this box; adjust if yours differs.
+sudo mkdir -p /models/qwen38/models /models/qwen38/cache
+sudo chown -R "$(id -u):$(id -g)" /models/qwen38
+
+# 2. ~98 GiB, 28 shards. The repo is public and ungated, so no token is required
+#    (anonymous downloads are rate-limited; `hf auth login` first if that bites).
+hf download myllmbox/Qwen3.8-Flash-Next-hibrid48 \
+  --local-dir /models/qwen38/models/Qwen3.8-Flash-Next-hibrid48
+```
+
+`/models/qwen38/models` is mounted at `/models` and `/models/qwen38/cache` at `/cache`; the
+container serves `/models/Qwen3.8-Flash-Next-hibrid48`. Both must be the same NVMe volume:
+`/cache` has to be writable and fast, because the first start writes the ~31 GB n-gram
+table map there (a few minutes, once, and it is rebuilt if you delete it). Later boots read
+that map and allocate almost nothing for the table — which is the whole point of this
+backend, and where the memory for the 26G KV pool comes from.
+
+The download is resumable; re-run the same command if it is interrupted. Do not point the
+volume at a tmpfs or at a network mount. The container runs as root, so `/models/qwen38/cache`
+ends up root-owned once the map is built — `sudo rm -rf /models/qwen38/cache/*` if you ever
+need to drop it and start over.
+
 ### 3. Start
 
 ```bash
@@ -160,7 +233,8 @@ docker compose up -d
 ```
 
 `litellm`, `db` and `redis` come up in seconds. **`vllm` takes 10–15 minutes** to load
-weights — it will sit unhealthy until then. See [Operations](#operations).
+weights (about 4 minutes on `qwen38-hibrid48`, plus a few minutes once for its table map) —
+it will sit unhealthy until then. See [Operations](#operations).
 
 ## systemd
 
@@ -280,30 +354,154 @@ docker compose down                     # stop everything
 `vllm` reports unhealthy for the whole weight load (the healthcheck's `start_period` is 20
 minutes). That is normal, not a failure.
 
+### GB10 smoke test for `qwen38-hibrid48`
+
+**This backend has not been run.** It was added without access to the GB10 — no inference
+was executed for this PR, and it has never been switched on. Everything below is the plan
+for the first time someone does, and each step has a pass condition you can actually check.
+Budget an hour, most of it waiting.
+
+Because `qwen38-fast` is the live backend, do this at a time when the gateway may be down
+for ~10 minutes, and finish with a deliberate choice of which block stays uncommented.
+
+**0. Before switching — does it even fit?**
+
+```bash
+df -h /models/qwen38                      # want >= 130 GB free, on the NVMe
+free -g                                   # want >= 100G available: one backend at a time
+ls /models/qwen38/models/Qwen3.8-Flash-Next-hibrid48/model.safetensors.index.json
+docker compose config --services          # exactly one vllm
+```
+
+**1. Startup.** Switch the block, then `docker compose up -d --remove-orphans`.
+
+- Pass: reaches `/health` 200 in ~4 minutes, plus a few minutes once on the first boot
+  while the table map is built.
+- Watch: `docker compose logs -f vllm`. Read the KV line it prints at startup and confirm
+  it reports the pool you expect (roughly 800k tokens for 26G bf16) — that is the check
+  that `--kv-cache-memory-bytes 26000000000` was read as 26e9 bytes and not rejected.
+- Confirm the map landed and is reusable: `du -sh /models/qwen38/cache` (~31 GB), then
+  `docker compose restart vllm` and check the second boot skips the map build.
+- Pass: `curl -s localhost:8000/v1/models` returns `qwen3.8-flash-next` — the same id the
+  fast backend serves, which is what keeps the `local` alias working.
+
+**2. A tool call, the way the harnesses actually call it.** Two `{role: system}` blocks —
+this is the Yeiberson/OpenCode shape, and the reason `qwen38-hibrid48.jinja` exists:
+
+```bash
+curl -s localhost:4000/v1/chat/completions -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H 'Content-Type: application/json' -d '{
+  "model":"local",
+  "messages":[
+    {"role":"system","content":"You are OpenCode, a coding agent."},
+    {"role":"system","content":"Hindsight context: the user is editing vllm-start-hibrid48.sh."},
+    {"role":"user","content":"Read /etc/hostname and tell me what it says."}
+  ],
+  "tools":[{"type":"function","function":{"name":"read_file","description":"Read a file",
+    "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]}'
+```
+
+- Pass: 200, with a `tool_calls` entry named `read_file` and `arguments` as an object.
+- Fail if you instead get `System message must be at the beginning.` (the template is not
+  the one being used — check the `--chat-template` path) or an empty `tool_calls` with the
+  call text left in `content` (the parser is wrong; this checkpoint wants `qwen3_xml`).
+- Then repeat through a real agent turn: send the assistant's `tool_calls` back with a
+  `role: tool` result and confirm the follow-up is a normal answer. That exercises the
+  multi-step-tool path in the template, not just the first hop.
+- Also check reasoning parsing: with thinking on (the default), the answer should arrive in
+  `reasoning_content` first and `content` later; an answer that never leaves `reasoning`
+  means `--reasoning-parser qwen3` is not matching this template.
+
+**3. Repeated-prefix TTFT.** Prefix caching is on, and this is where the fast backend's
+20 GiB pool and this one's 26 GiB are most comparable. Send the same long system prompt
+twice (say ~8k tokens) and compare:
+
+- Pass: the second request's TTFT is a small fraction of the first, and
+  `vllm:prefix_cache_hit_rate` (or the hit counters) moves off zero.
+- Note the first-request TTFT separately — with the table on NVMe, the first tokens after
+  a cold start also pay for page-ins, so do not read request one as steady state.
+
+**4. Decode rate.** Measure the same way for both backends or the numbers are not
+comparable: thinking off, a fixed prompt, `stream: true`, and compute
+`completion_tokens / (last_token_time - first_token_time)`.
+
+- Pass: within the range the kit publishes on one Spark (73 tok/s single stream, ~288 at 16
+  streams) minus what the different seats and this box's other services cost.
+- Expect this to be *slower* than `qwen38-fast` at low concurrency and to close or cross
+  over as concurrency rises — the fast backend is the one that is ~33% quicker decoding.
+  Report it at 1 stream and at `--max-num-seqs` (16) at least.
+- **The seats differ**: this backend runs upstream's 16, the other two run 8. That is
+  upstream's shipped configuration, kept deliberately, but it makes the concurrency rungs
+  an unfair comparison as they stand. To compare like for like, set `--max-num-seqs 8` *and*
+  truncate the cudagraph capture sizes to
+  `[1,2,4,6,8,12,16,18,24,30,36,42,48]` — they must stay multiples of K+1 up to `seats × 6`,
+  or the upper rungs decode without CUDA graphs.
+- Also read speculative-decoding acceptance if the build exposes it: at K=5 the kit reports
+  ~5.1 of 6 accepted on code. Materially lower means the draft path is not working and the
+  speed number is not the one this backend is supposed to produce.
+
+**5. Host memory.** GB10 unified memory is the hard constraint.
+
+```bash
+free -g                                   # MemAvailable, before and at full load
+curl -s localhost:8000/metrics | grep -E 'kv_cache_usage|num_requests_(running|waiting)'
+docker stats --no-stream vllm
+```
+
+- Pass: `MemAvailable` stays positive (the kit measures ~2.8–2.9G at 16 streams on a box
+  running nothing else; expect less here). If it goes to zero, or the engine is killed,
+  drop `--kv-cache-memory-bytes` to `24000000000` and retry — that is the knob, and it is a
+  one-line change
+  in the serve script.
+- Do this while the *other* services are up, since that is the real configuration.
+
+**6. NVMe I/O.** The point of this backend is that the table does not sit in RAM.
+
+```bash
+iostat -x 1 30                             # or: watch -n1 'cat /sys/block/nvme0n1/stat'
+du -sh /models/qwen38/cache                # the table map
+```
+
+- Pass: during decode, the NVMe device shows real read throughput that *persists* across a
+  long run rather than a burst while the map is paged in and then nothing. A steady ~0
+  read rate during decode means the table ended up resident, which is worth knowing — you
+  would be measuring a different thing than the kit measures.
+- Watch for the opposite failure too: reads that never settle, or `%util` pinned at 100,
+  mean the working set is thrashing the page cache against the 26G KV pool.
+- Finally, confirm the map is not being rebuilt on every boot (step 1's restart check).
+
+**7. Leave it in a known state.** Record which block is uncommented, `docker compose ps`
+output, and the numbers above. Then either switch back to `qwen38-fast` (restore the
+comment markers, `docker compose up -d --remove-orphans`) or state plainly that
+`qwen38-hibrid48` is now the live backend — the PR that adds this backend does not switch
+it on, so that decision is the operator's.
+
 ## Notes
 
 ### The vLLM services
 
-Both backends run Eugr's B12x image and mirror the corresponding upstream recipe's
-`command:` block with its template placeholders inlined, so the two stay easy to diff.
-Every argument is quoted deliberately: `--speculative-config '{...}'` and
+Each backend mirrors the `command:`/`vllm:` block of its upstream recipe with the template
+placeholders inlined, so the two stay easy to diff: `qwen38-fast` and `qwen38` against
+Eugr's B12x recipes, `qwen38-hibrid48` against bilikaz's `recipe.yaml` (whose `run.sh` maps
+`name: value` to `--name value`, which is why that block's flags look plainer). Every
+argument is quoted deliberately: `--speculative-config '{...}'` and
 `--compilation-config '{...}'` are single-quoted so the shell hands vLLM one JSON
-argument. If you edit the flags, re-check the resulting argv (`bash -x` or the
-stub-run technique) rather than assuming.
+argument. If you edit the flags, re-check the resulting argv rather than assuming — put a
+stub `vllm` on `PATH` that prints `"$@"`, run the script's `exec` line, and diff the flags
+against the recipe.
 
-The image's entrypoint is `["vllm","serve"]`, which is why the serve command lives in a
+The images' entrypoint is `["vllm","serve"]`, which is why the serve command lives in a
 script driven by `entrypoint:` rather than in `command:` — a `command:` value would have
 `vllm serve` prepended to it.
 
-Both services set `security_opt: ["seccomp=unconfined"]`, and that is **required**, not
-hardening drift. The B12x PLE reader does its scatter-gather reads through io_uring, and
-Docker's default seccomp profile blocks `io_uring_setup`; without this the engine dies ~3
-minutes into the weight load with `io_uring initialization failed: Operation not
-permitted`. Eugr's launcher runs containers `--privileged` (which also drops seccomp),
-which is why upstream never sees it. Unconfining seccomp is the *only* piece of
-`--privileged` taken here — the GPU reservation, capabilities, device list and mounts are
-all still restricted. It is needed on both backends, since both offload the PLE table to
-disk.
+All three services set `security_opt: ["seccomp=unconfined"]`, and that is **required**, not
+hardening drift. Both engines reach their n-gram table through io_uring — the B12x PLE
+reader with scatter-gather reads, the v4 image's table library against the NVMe map — and
+Docker's default seccomp profile blocks `io_uring_setup`; without this the engine dies a few
+minutes into the weight load with `io_uring initialization failed: Operation not permitted`.
+Both upstream launchers run containers `--privileged` (which also drops seccomp), which is
+why upstream never sees it. Unconfining seccomp is the *only* piece of `--privileged` taken
+here — the GPU reservation, capabilities, device list and mounts are all still restricted.
 
 `qwen38-fast` additionally runs the vendored `mods/flashnext-int4-b12x/` before serving:
 it builds two symlink farms under `/workspace/flashnext` (the served model, with the PLE
@@ -313,13 +511,40 @@ idempotent and re-run on every container start — the image itself is never mod
 required patch that cannot be applied aborts the launch rather than serving a broken
 model. See `mods/flashnext-int4-b12x/README.md`.
 
+`qwen38-hibrid48` needs none of that: its image carries its own patches, and the script
+does three things — check the checkpoint is there, make sure `/cache` is writable, serve.
+It is also the odd one out on purpose, so do not "harmonise" it with the other two:
+
+- **No RDMA anything.** No RoCE env, no `/dev/infiniband`, no `cap_add: IPC_LOCK`, no
+  `memlock` ulimit. Those come from the B12x recipes (where they are inert on one box
+  anyway) and the v4 image does not want them. This is the local-NVMe sibling of the engine
+  behind Saren's `magi-v2`, not the RDMA one.
+- **KV memory.** `--kv-cache-memory-bytes 26000000000`. This is the *same option* the
+  `qwen38-fast` script already passes — the recipe writes it as `--kv-cache-memory`, an
+  unambiguous argparse abbreviation of it, and this repo spells it in full so nothing
+  depends on prefix matching. Only the value differs. The option takes bytes, and its
+  parser also accepts a suffix, where **case matters**: `26g` is 26e9 (decimal) and `26G`
+  is 26 GiB (binary), ~7% more for the same two characters — which is why the full byte
+  count is written out here. Upstream ships `27000000000` (its "27G", 830,582 tokens); this
+  repo pins `26000000000` — `26g` — because the recipe documents 26G for a box that runs
+  other things, and this box runs litellm, Postgres, Redis, Open WebUI and both exporters.
+  It is a bound, not a measured capacity: read the pool size off the startup log (step 1 of
+  the smoke test) and watch `vllm:kv_cache_usage_perc` against the host's `MemAvailable`.
+- **`cpuset: "5-9,15-19"`** from the recipe — the GB10's ten 3.9GHz Cortex-X925 cores.
+  Worth a couple of percent; drop it if you would rather the scheduler place the container
+  freely alongside everything else.
+- **`--block-size 1632`** is required at K=5, not a tuning choice: without it the boot stops
+  with `QSA ring capacity 12 must divide the attention block size 1616`. Likewise the
+  cudagraph capture sizes are multiples of K+1 up to `max-num-seqs × 6`; if you change
+  `--max-num-seqs`, change them together or the top rungs decode without CUDA graphs.
+
 ### Chat templates
 
 `chat-templates/` holds copies of each checkpoint's **own** template with exactly one
 change: consecutive *leading* system messages are merged into a single system block.
 
-This is needed because both checkpoints' templates consume only `messages[0]` as the system
-prefix and then raise `System message must be at the beginning.` on a second one — and the
+This is needed because all three checkpoints' templates consume only `messages[0]` as the
+system prefix and then raise `System message must be at the beginning.` on a second one — and the
 agent harnesses used against this gateway (OpenCode, Hindsight) emit two `{role: system}`
 blocks. Nothing else is touched: tool calling, reasoning/thinking tokens, special tokens
 and the assistant generation prompt are upstream's, verbatim. A request with a single
@@ -335,9 +560,26 @@ rejected, as upstream does.
   `chat_template.jinja` (byte-identical to the `nvidia/…` one), plus the merge. Unlike
   upstream's recipe, which passes no `--chat-template` and takes the model default, the
   full backend passes this file explicitly.
+- `qwen38-hibrid48.jinja` — from the `myllmbox/Qwen3.8-Flash-Next-hibrid48` checkpoint's own
+  `chat_template.jinja`, plus the merge. The v4 recipe also passes no `--chat-template`;
+  this repo passes this file explicitly for the same reason as the full backend.
+
+The hibrid48 template was **not** assumed to match the others. The checkpoint's file was
+fetched and compared before reuse: it is byte-identical to the `local-inference-lab/…`
+template (8952 bytes, and to the copy embedded in `tokenizer_config.json` too), so
+`qwen38-hibrid48.jinja` differs from `qwen38-full.jinja` only in its provenance header, and
+the two bodies are byte-identical. If either upstream file moves, re-derive both and re-run
+the rendering diff instead of trusting that note.
+
+Tool-call parsing is per-backend and tracks the recipe: `qwen38-fast` uses
+`--tool-call-parser qwen3_coder`, while `qwen38` and `qwen38-hibrid48` use `qwen3_xml`. All
+three use `--reasoning-parser qwen3`, and all three templates gate thinking on the same
+`chat_template_kwargs.enable_thinking`.
 
 To update a template, re-derive it from the checkpoint rather than editing by hand, then
-re-run the rendering diff. The upstream files are inside the cached snapshots.
+re-run the rendering diff. The upstream files are inside the cached snapshots — and for
+hibrid48 it is a single file, at
+`https://huggingface.co/myllmbox/Qwen3.8-Flash-Next-hibrid48/resolve/main/chat_template.jinja`.
 
 ### Caching
 
@@ -373,4 +615,13 @@ model: deepseek/deepseek-chat
 | `local` returns 429 "No deployments available" | a previous call 404'd and put the deployment in cooldown. Check `api_base` ends in `/v1` — the provider appends the path verbatim and vLLM 404s without it |
 | `local` returns 404 from vLLM | same cause as above |
 | vLLM container exits with `EADDRINUSE` | another server holds port 8000 |
+| `qwen38-hibrid48` exits: `FATAL vllm-start-hibrid48: /models/… is not mounted` | the checkpoint is a separate ~98 GiB `--local-dir` download, not the HF cache; see [Prerequisites](#2-prerequisites) |
+| `qwen38-hibrid48` exits: `FATAL vllm-start-hibrid48: … has no ple_quantization` | wrong checkpoint mounted at `/models` — this image serves `myllmbox/Qwen3.8-Flash-Next-hibrid48` only, not the B12x or `nvidia/…` ones |
+| `qwen38-hibrid48` exits: `cannot create /cache/vllm-cache` | `/models/qwen38/cache` is missing, read-only, or not mounted. It must be writable: the first boot writes the ~31 GB table map there |
+| `qwen38-hibrid48` stops with `invalid quant` | the image's table library rejected the n-gram table. Usually a partial download, or a table from a different release — re-download and re-check `du -sh` against the 28 shards |
+| `qwen38-hibrid48` stops with `QSA ring capacity 12 must divide the attention block size 1616` | `--block-size 1632` was dropped. It is required at K=5, not a tuning choice |
+| `qwen38-hibrid48` comes up but OOMs under load | `--kv-cache-memory-bytes 26000000000` is too big for a box that is also running everything else — drop it to `24000000000` and re-run the memory step of the [smoke test](#gb10-smoke-test-for-qwen38-hibrid48) |
+| A `--kv-cache-memory*` value came out ~7% smaller than intended | the suffix is case-sensitive: `26g` is decimal (26e9), `26G` is binary (26 GiB). Write the byte count out, or use the case you mean |
+| `--kv-cache-memory` rejected as ambiguous | another `--kv-cache-memory*` option exists in this build and the abbreviation no longer resolves. Use the full `--kv-cache-memory-bytes` |
+| `qwen38-hibrid48` answers but never emits `tool_calls` | the tool call landed in `content` instead — the parser must be `qwen3_xml` for this checkpoint, not the fast backend's `qwen3_coder` |
 | Repeated cached answers | global `cache: true`; see [Caching](#caching) |

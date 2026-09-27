@@ -49,21 +49,25 @@ services:
       - redis_data:/data
 
   # ===========================================================================
-  #  vLLM backend - exactly ONE of the two services below may be uncommented.
+  #  vLLM backend - exactly ONE of the three services below may be uncommented.
   #
-  #  Both are the same service name (`vllm`) with the same ports and the same
+  #  All three are the same service name (`vllm`) with the same ports and the same
   #  --served-model-name (qwen3.8-flash-next), so LiteLLM's http://vllm:8000/v1
   #  and the `local` model alias never change when you switch. config.yaml is
   #  untouched by a switch and no caller can tell which backend is up.
   #
-  #  TO SWITCH: comment out the block that is active, uncomment the other, then
+  #  TO SWITCH: comment out the block that is active, uncomment the one you want,
+  #  then
   #      docker compose up -d --remove-orphans
-  #  Only one may run at a time - they would fight for the GPU and port 8000.
-  #  The commented-out one additionally needs its checkpoint downloaded first;
-  #  its startup script fails fast with the download command if it is missing.
+  #  Only one may run at a time - they would fight for the GPU and port 8000, and
+  #  the box has unified memory for one of them, not two. The commented-out ones
+  #  additionally need their checkpoint downloaded first; each startup script
+  #  fails fast with the download command if it is missing.
   #
-  #  Both use Eugr's B12x image, pinned by digest because upstream `latest` has
-  #  since moved and the newer build is not a drop-in for these checkpoints.
+  #  qwen38-fast and qwen38 run Eugr's B12x image; qwen38-hibrid48 runs bilikaz's
+  #  myllmbox v4 image. Both images are pinned by digest, because the upstream
+  #  `latest` tags have since moved and the newer builds are not drop-ins for
+  #  these checkpoints.
   # ===========================================================================
 
   # --- ACTIVE: qwen38-fast - Qwen3.8-Flash-Next A5B INT4 AutoRound ------------
@@ -231,6 +235,87 @@ services:
   #     HF_HUB_OFFLINE: "1"
   #     TRANSFORMERS_OFFLINE: "1"
   #   entrypoint: ["/bin/bash", "/workspace/vllm-start-full.sh"]
+  #   healthcheck:
+  #     test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 1200s
+
+  # --- ALTERNATIVE: qwen38-hibrid48 - NVFP4 body, n-gram table on local NVMe --
+  # bilikaz's single-Spark kit (myllmbox image v4, vLLM 0.30): the 125B-A6B NVFP4
+  # checkpoint with a 4-bit output head, whose n-gram table is demand-paged from local
+  # NVMe by the image's own reader instead of being held in memory. No RDMA peer and no
+  # second box - this is the local-NVMe sibling of the engine behind Saren's magi-v2,
+  # not the RDMA one. A different model and a different image from qwen38-fast; served
+  # for comparison against it.
+  #
+  # To activate: comment out the ACTIVE qwen38-fast block above, delete the leading '#'
+  # from this block, then `docker compose up -d --remove-orphans`. Reversing that
+  # switches back. The checkpoint is a separate ~98 GiB download and the first boot
+  # writes a ~31 GiB table map, so give it ~130 GB of NVMe; see the README.
+  #
+  # vllm:
+  #   image: myllmbox/qwen38-flash-next-vllm@sha256:51629f438f5ba3f7a96db110826c783d69b91a6851c43fb07d447644f157dcc4
+  #   restart: always
+  #   container_name: vllm-qwen38-flash
+  #   ports:
+  #     - "127.0.0.1:8000:8000"
+  #     - "192.168.0.96:8000:8000"
+  #   ipc: host
+  #   shm_size: 32gb
+  #   # Upstream's cpuset: the GB10's ten 3.9GHz Cortex-X925 cores (0-4 and 10-14 are
+  #   # 2.8GHz A725). Worth a couple of percent; drop it to let the scheduler place this
+  #   # alongside the other containers instead.
+  #   cpuset: "5-9,15-19"
+  #   ulimits:
+  #     nofile: 65535
+  #   # REQUIRED: the image's NVMe table reader uses io_uring, and Docker's default
+  #   # seccomp profile blocks io_uring_setup. Upstream passes the same thing via
+  #   # docker_args, and still runs the container unprivileged.
+  #   security_opt:
+  #     - seccomp=unconfined
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   volumes:
+  #     # The checkpoint, ~98 GiB - a real directory from `hf download --local-dir`, not
+  #     # the shared HF cache the other backends use. Read-write, as in the upstream kit.
+  #     - /models/qwen38/models:/models
+  #     # MUST be writable and MUST be NVMe: the first boot prepares the ~31 GiB table map
+  #     # here (a few minutes, once) and every later request reads it. On tmpfs it would be
+  #     # rebuilt on every boot and eat the unified memory this is meant to free.
+  #     - /models/qwen38/cache:/cache
+  #     # Our chat template: the checkpoint's own with leading system messages merged -
+  #     # see chat-templates/ and the README.
+  #     - ./chat-templates:/workspace/chat-templates:ro
+  #     - ./vllm-start-hibrid48.sh:/workspace/vllm-start-hibrid48.sh:ro
+  #   environment:
+  #     # --- the image's table reader, demand-paging the n-gram table from /cache -----
+  #     MBX_PLE_MMAP: "1"
+  #     MBX_PLE_MMAP_MODE: nvme
+  #     MBX_PLE_MMAP_PREWARM: "0"
+  #     VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+  #     VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  #     # --- the recipe's env ---------------------------------------------------------
+  #     TORCH_CUDA_ARCH_LIST: "12.1a"
+  #     FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+  #     PYTHONUNBUFFERED: "1"
+  #     # glibc hands big freed blocks back to the OS at once; without this the loader's
+  #     # garbage stays resident and swaps.
+  #     MALLOC_MMAP_THRESHOLD_: "65536"
+  #     MALLOC_TRIM_THRESHOLD_: "131072"
+  #     # --- writable state, both under the /cache mount -------------------------------
+  #     VLLM_CACHE_ROOT: /cache/vllm-cache
+  #     FLASHINFER_WORKSPACE_BASE: /cache/flashinfer-workspace
+  #     # --- nothing is fetched at runtime --------------------------------------------
+  #     HF_HUB_OFFLINE: "1"
+  #     TRANSFORMERS_OFFLINE: "1"
+  #   entrypoint: ["/bin/bash", "/workspace/vllm-start-hibrid48.sh"]
   #   healthcheck:
   #     test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
   #     interval: 30s
