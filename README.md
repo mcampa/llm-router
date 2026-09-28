@@ -498,6 +498,8 @@ Recorded so the next person has a baseline to compare against. Same box, same
 | Repeated-prefix TTFT | **2.4 s warm vs 69.8 s cold (29×)** on a ~10k-token prefix | — |
 | Spec-decode acceptance | **0.68** (1570/2325 drafted) | 5.1 of 6 on code (~0.85) |
 | NVMe reads during decode | ~4.3 MB/s, ~1600 IOPS at ~4 KB | — |
+| **Prefill, uncached** | **~1,300 tok/s** (77k prompt tokens in 60 s under live agent load) | — |
+| Prefill, cache hit | ~25,000 tok/s | — |
 | Host memory, idle | 1 GB free / 3–4 GB available, page cache 4.3 GB | 5.7 GB available at 1 stream |
 | Artifacts | healthy, `RestartCount=0`, no OOM | — |
 
@@ -512,6 +514,34 @@ costs tokens per engine step), the kit excludes prefill from its measurement win
 these include TTFT, and `vm.compaction_proactiveness` is still **20** on this box — upstream
 measures that alone at ~10% plus 4–5 s stalls, and its `run.sh` warns on every launch. Setting
 it to 0 (`./tune-host.sh`, needs root) is the single highest-value next step.
+
+#### A real agent on this backend: prefill is the bottleneck, not decode
+
+Measured with an actual agent harness driving the gateway (not a synthetic prompt), which is
+the workload this backend exists for. Sampled over 60 s of its traffic:
+
+```
+requests finished : 0
+decode tokens     : 111    -> 1.8 tok/s aggregate
+prefill tokens    : 77,182 -> 1,286 tok/s
+```
+
+The aggregate *decode* number is near-useless here, and that is the point: the agent spent that
+minute **reading a large prompt, not writing**. On the intervals where it was actually decoding
+it ran at 24–59 tok/s, mean ~40 — the same figure as the synthetic single-stream test, so the
+backend delivers its decode rate under real load. What an agent spends its wall-clock on is
+prefill.
+
+Practical consequence: a ~20k-token context that misses the prefix cache costs ~15 s before the
+first token; the same context on a second turn is nearly free (29× TTFT, above). So if an agent
+session feels slow here, look at prompt growth and cache hits before blaming decode.
+
+The likely reason prefill is the weak side is structural: GB10 has no native FP4 compute, so
+`--moe-backend marlin` dequantizes weight-only (the boot logs a warning saying exactly this).
+That is cheap for decode, which is memory-bound, and expensive for prefill, which is
+compute-bound. It is upstream's own recommended kernel for this checkpoint on this hardware —
+the intended trade-off on a Spark, not a misconfiguration, and not something a flag here can
+fix.
 
 Two things that were checked and are *not* problems, having been suspected: the box is not
 memory-thrashing (`/proc/pressure/memory` and `/io` are ~0, and the other six containers total
