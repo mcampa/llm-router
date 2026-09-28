@@ -638,10 +638,48 @@ rejected, as upstream does.
 
 The hibrid48 template was **not** assumed to match the others. The checkpoint's file was
 fetched and compared before reuse: it is byte-identical to the `local-inference-lab/…`
-template (8952 bytes, and to the copy embedded in `tokenizer_config.json` too), so
-`qwen38-hibrid48.jinja` differs from `qwen38-full.jinja` only in its provenance header, and
-the two bodies are byte-identical. If either upstream file moves, re-derive both and re-run
-the rendering diff instead of trusting that note.
+template (8952 bytes, and to the copy embedded in `tokenizer_config.json` too). On top of that
+shared base, `qwen38-hibrid48.jinja` carries a **second** change beyond the merge —
+`reasoning_effort` defaults to `medium` instead of upstream's `xhigh` — so it is no longer
+byte-identical to `qwen38-full.jinja`. Verified by rendering: for any *explicit*
+`reasoning_effort` (xhigh/medium/low), and for thinking-off, its output is byte-identical to
+the checkpoint's own template. If either upstream file moves, re-derive both and re-run the
+rendering diff instead of trusting that note.
+
+#### Why `reasoning_effort` defaults to `medium` here
+
+Because `xhigh` breaks tool calls. This box's first real agent workload hit it: LiteLLM logged
+13 `Failed to parse tool call arguments` events, all with truncated JSON (`Unterminated string
+starting at…`), and vLLM reported **34 of 56 requests finishing with `finish_reason: length`**.
+`abort` was 0, so nothing was cancelling — the output budget was simply being spent before the
+tool call was written. Reproduced directly, same prompt, only the thinking setting varying,
+against a 300-token budget:
+
+| setting | finish | completion | reasoning | tool call |
+|---|---|---|---|---|
+| `xhigh` (upstream default) | `length` | 300 | **300** | **never emitted** |
+| `medium` (upstream's other option) | `length` | 300 | **300** | **never emitted** |
+| `low` | `tool_calls` | 283 | 199 | **valid JSON** |
+| thinking off | `tool_calls` | 83 | 0 | **valid JSON** |
+
+`medium` is a **mitigation, not a fix**, and the measurements say why. Re-run against the live
+service at a 2,000-token budget, the default (now `medium`) used **275** reasoning tokens where
+an explicit `xhigh` used **510** — roughly half — and the previously-failing 300-token tool call
+now completes. But the effort label *nudges* the model, it does not *bound* it: across samples,
+`low` produced 199 reasoning tokens once and 299 the next, overrunning a 300-token budget in
+the second case and losing the tool call entirely. Only thinking-off was consistent — 0
+reasoning tokens, 77 total, valid tool call every time.
+
+So, for tool-calling turns: **disable thinking** if the budget is tight and you want a
+guarantee, or give a generous `max_tokens` and treat `reasoning_effort` as a tuning knob rather
+than a limit. An agent that passes an explicit `reasoning_effort` gets upstream's behavior
+unchanged — the default is all this changes.
+
+`qwen38-fast` was already patched this way (its header records *"default reasoning effort
+medium"*), so before this change a backend switch silently changed how verbose the model was.
+This brings the two into line. A harness should also treat `finish_reason: "length"` as
+truncation rather than parsing the partial arguments — that is the actual client-side crash, and
+it will recur on any backend.
 
 Tool-call parsing is per-backend and tracks the recipe: `qwen38-fast` uses
 `--tool-call-parser qwen3_coder`, while `qwen38` and `qwen38-hibrid48` use `qwen3_xml`. All
@@ -696,4 +734,6 @@ model: deepseek/deepseek-chat
 | A `--kv-cache-memory*` value came out ~7% smaller than intended | the suffix is case-sensitive: `26g` is decimal (26e9), `26G` is binary (26 GiB). Write the byte count out, or use the case you mean |
 | `--kv-cache-memory` rejected as ambiguous | another `--kv-cache-memory*` option exists in this build and the abbreviation no longer resolves. Use the full `--kv-cache-memory-bytes` |
 | `qwen38-hibrid48` answers but never emits `tool_calls` | the tool call landed in `content` instead — the parser must be `qwen3_xml` for this checkpoint, not the fast backend's `qwen3_coder` |
+| Tool calls arrive with truncated/invalid `arguments`, and the client crashes parsing them | the output budget was spent on reasoning before the tool call was written. Check `finish_reason: length` and `vllm:request_success_total{finished_reason="length"}`; LiteLLM logs `Failed to parse tool call arguments` → `Unterminated string`. Fix on the caller: raise `max_tokens`, or send `chat_template_kwargs: {"reasoning_effort": "low"}`, or `{"enable_thinking": false}`. See [Why reasoning_effort defaults to medium](#why-reasoning_effort-defaults-to-medium-here) |
+| Most requests finish with `finish_reason: length` | same cause — the agent's `max_tokens` is too small for a thinking-on model. This is a caller-side budget, not a backend limit |
 | Repeated cached answers | global `cache: true`; see [Caching](#caching) |

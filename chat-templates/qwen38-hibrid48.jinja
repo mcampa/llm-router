@@ -1,15 +1,26 @@
 {#- Local patch over myllmbox/Qwen3.8-Flash-Next-hibrid48 chat_template.jinja
-    The hibrid48 checkpoint's own template is byte-identical (8952 bytes; the copy embedded
-    in tokenizer_config.json too) to the local-inference-lab/Qwen3.8-Flash-Next-NVFP4 one, so
-    this file's body is byte-identical to chat-templates/qwen38-full.jinja - only this header
-    differs. Verified against the checkpoint before reuse; if either upstream file moves,
-    re-derive both and re-run the rendering diff instead of trusting this note.
-    Merges consecutive *leading* system messages into one system prefix. OpenCode +
-    Hindsight emit two {{role:system}} blocks; the upstream template only ever consumed
-    messages[0] and then raised "System message must be at the beginning." on the second.
-    A request with a single leading system message renders byte-identically to upstream.
-    Nothing else is changed: tool calling, reasoning/thinking, special tokens and the
-    assistant generation prompt are upstream's. -#}
+    The checkpoint's own template is byte-identical (8952 bytes; the copy embedded in
+    tokenizer_config.json too) to the local-inference-lab/Qwen3.8-Flash-Next-NVFP4 one, and
+    to chat-templates/qwen38-full.jinja. Two deliberate changes over it:
+
+    (1) Consecutive *leading* system messages merge into one system prefix instead of raising.
+        OpenCode + Hindsight emit two {{role:system}} blocks; upstream consumed only messages[0]
+        and then raised "System message must be at the beginning." on the second. A request with
+        a single leading system message renders byte-identically to upstream. A system message
+        anywhere *after* the leading run is still rejected, as upstream does.
+
+    (2) reasoning_effort defaults to 'medium' rather than upstream's 'xhigh'. This is the same
+        patch this repo already applies to qwen38-fast-medium.jinja, for the same reason:
+        'xhigh' reasoning is verbose enough to spend a typical agent's whole max_tokens budget,
+        which truncates the response (finish_reason=length) and can cut a tool call off
+        mid-JSON. Measured on this box, an agent with a ~300-token budget got no tool call at
+        all under 'xhigh'; under 'low' the call fit and parsed. 'low' is the documented escape
+        hatch for tool-calling turns. An *explicit* reasoning_effort still renders exactly as
+        upstream does.
+
+    Verified by rendering: for any explicit reasoning_effort (xhigh/medium/low), and for
+    thinking-off, this file's output is byte-identical to upstream's. Re-derive from the
+    checkpoint rather than editing by hand if either upstream file moves. -#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
 {%- macro render_content(content, do_vision_count, is_system_content=false) %}
@@ -56,9 +67,9 @@
 {%- endif %}
 {%- set reasoning_instructions = '' %}
 {%- if enable_thinking is undefined or enable_thinking is true %}
-    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+    {%- set resolved_reasoning_effort = reasoning_effort|default('medium') %}
     {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
-        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh, medium (default), and low.') }}
     {%- endif %}
     {%- if resolved_reasoning_effort == 'xhigh' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
