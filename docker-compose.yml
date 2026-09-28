@@ -309,9 +309,18 @@ services:
   #     # garbage stays resident and swaps.
   #     MALLOC_MMAP_THRESHOLD_: "65536"
   #     MALLOC_TRIM_THRESHOLD_: "131072"
-  #     # --- writable state, both under the /cache mount -------------------------------
+  #     # --- writable state, all under the /cache mount ---------------------------------
   #     VLLM_CACHE_ROOT: /cache/vllm-cache
   #     FLASHINFER_WORKSPACE_BASE: /cache/flashinfer-workspace
+  #     # Triton keeps its own cache and does NOT read VLLM_CACHE_ROOT. Unset, it writes
+  #     # $HOME/.triton/cache and HOME is /root - inside the image layer - so every
+  #     # recreate discards ~100 MB of compiled kernels and the next requests rebuild
+  #     # them mid-inference. vLLM says so itself: "Triton kernel JIT compilation during
+  #     # inference: _ple_conv_kernel. This causes a latency spike". Measured here: the
+  #     # window that logged those saw 26-46 s requests (prefill-bound) against 4-9 s for
+  #     # the same shape afterwards. Pointing it at /cache makes the compile one-off
+  #     # instead of once per container.
+  #     TRITON_CACHE_DIR: /cache/triton
   #     # --- nothing is fetched at runtime --------------------------------------------
   #     HF_HUB_OFFLINE: "1"
   #     TRANSFORMERS_OFFLINE: "1"
