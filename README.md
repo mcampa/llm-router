@@ -51,7 +51,7 @@ script passes the same `--served-model-name`.
 | Startup script | `vllm-start-fast.sh` | `vllm-start-full.sh` | `vllm-start-hibrid48.sh` |
 | Chat template | `qwen38-fast-medium.jinja` | `qwen38-full.jinja` | `qwen38-hibrid48.jinja` |
 | Extra pieces | the vendored `mods/flashnext-int4-b12x/` | none | a ~31 GB table map under `/cache`, built on first boot |
-| Decode on this box | baseline (~33% faster than the full NVFP4 model) | not measured | **not measured — see the smoke test** |
+| Decode on this box | baseline (~33% faster than the full NVFP4 model) | not measured | **43 tok/s 1-stream, 201 at c=16** — see [First boot](#first-boot-on-this-box-what-it-actually-did-2026-09-28) |
 
 Only one may run at a time: they would fight for the GPU and port 8000, and the box has
 unified memory for one of them, not two.
@@ -408,9 +408,15 @@ curl -s localhost:4000/v1/chat/completions -H "Authorization: Bearer $LITELLM_MA
 - Then repeat through a real agent turn: send the assistant's `tool_calls` back with a
   `role: tool` result and confirm the follow-up is a normal answer. That exercises the
   multi-step-tool path in the template, not just the first hop.
-- Also check reasoning parsing: with thinking on (the default), the answer should arrive in
-  `reasoning_content` first and `content` later; an answer that never leaves `reasoning`
-  means `--reasoning-parser qwen3` is not matching this template.
+- Also check reasoning parsing: with thinking on (the default) the answer arrives in the
+  **`reasoning`** field, with `content` holding only the final answer. Note the field name —
+  this image returns `reasoning`, **not** `reasoning_content`, which is why the Usage section
+  above and the fast backend's template already read `reasoning`. An answer that never leaves
+  `reasoning` at all means `--reasoning-parser qwen3` is not matching this template. (There
+  is a related asymmetry worth knowing: all three templates read *prior-turn* reasoning from
+  `reasoning_content` only, so multi-turn thinking preservation is a no-op here even though
+  the templates request it — the fast template was patched to read `reasoning` for exactly
+  this reason. Left as-is to keep this template upstream-plus-merge; see the PR.)
 
 **3. Repeated-prefix TTFT.** Prefix caching is on, and this is where the fast backend's
 20 GiB pool and this one's 26 GiB are most comparable. Send the same long system prompt
@@ -475,6 +481,42 @@ output, and the numbers above. Then either switch back to `qwen38-fast` (restore
 comment markers, `docker compose up -d --remove-orphans`) or state plainly that
 `qwen38-hibrid48` is now the live backend — the PR that adds this backend does not switch
 it on, so that decision is the operator's.
+
+#### First boot on this box: what it actually did (2026-09-28)
+
+Recorded so the next person has a baseline to compare against. Same box, same
+`config.yaml`, `qwen38-fast` stopped for the whole window.
+
+| | measured | kit's published figure |
+|---|---|---|
+| Boot to `/health` 200 | **~6.3 min** (65.8 s of it loading weights) | ~4 min + first-boot table map |
+| Table map under `/cache` | **30 GB**, built on that first boot | ~31 GB, a few minutes, once |
+| KV pool | **800,229 tokens**, 24.21 GiB | "26G ≈ 800k" |
+| Single stream decode | **43.0 tok/s** mean (48.2 / 39.2 / 41.6) | 73 |
+| c=4 aggregate | **110 tok/s** | 154 |
+| c=16 aggregate | **201 tok/s** | 288 |
+| Repeated-prefix TTFT | **2.4 s warm vs 69.8 s cold (29×)** on a ~10k-token prefix | — |
+| Spec-decode acceptance | **0.68** (1570/2325 drafted) | 5.1 of 6 on code (~0.85) |
+| NVMe reads during decode | ~4.3 MB/s, ~1600 IOPS at ~4 KB | — |
+| Host memory, idle | 1 GB free / 3–4 GB available, page cache 4.3 GB | 5.7 GB available at 1 stream |
+| Artifacts | healthy, `RestartCount=0`, no OOM | — |
+
+Every flag was confirmed in the boot log: `v0.30.0`, `quantization=modelopt_mixed`, `num_spec_tokens=5`,
+the full v4 cudagraph capture list, `moe_backend=marlin`, the Triton/FLA GDN prefill kernel,
+and `PLE: NVFP4 table DEMAND-PAGED from /models/Qwen3.8-Flash-Next-hibrid48`.
+
+**Read the throughput column as a lower bound, not a shortfall.** Three things separate it
+from the kit's ladder, and none of them is a fault in the deployment: the kit's figures are
+code prompts (acceptance ~0.85; the plain-text prompt used here accepts 0.68, which directly
+costs tokens per engine step), the kit excludes prefill from its measurement windows while
+these include TTFT, and `vm.compaction_proactiveness` is still **20** on this box — upstream
+measures that alone at ~10% plus 4–5 s stalls, and its `run.sh` warns on every launch. Setting
+it to 0 (`./tune-host.sh`, needs root) is the single highest-value next step.
+
+Two things that were checked and are *not* problems, having been suspected: the box is not
+memory-thrashing (`/proc/pressure/memory` and `/io` are ~0, and the other six containers total
+under 1 GB), and the NVMe is not saturated (4 KB random table lookups at ~1600 IOPS, far
+below the device). The GPU idles at 611 MHz and holds 923 MHz under load.
 
 ## Notes
 
