@@ -70,106 +70,106 @@ services:
   #  these checkpoints.
   # ===========================================================================
 
-  # --- ACTIVE: qwen38-fast - Qwen3.8-Flash-Next A5B INT4 AutoRound ------------
-  # The 125B-A5B Intel AutoRound int4 requant (~33% faster decode than the full
-  # NVFP4 model on this box) served by the current B12x stack. See
-  # vllm-start-fast.sh for the serve flags and mods/flashnext-int4-b12x/ for the
-  # model views + vLLM patches it applies at startup.
-  vllm:
-    image: eugr/spark-vllm-b12x@sha256:8e7e062186f841453ef0ec6f713043c5b65447decc3835206685128c18e42262
-    restart: always
-    container_name: vllm-qwen38-flash
-    # On the compose bridge, deliberately NOT host networking. vLLM passes
-    # --host 0.0.0.0 inside its own network namespace; the published port below
-    # is what controls host/LAN reachability.
-    ports:
-      # Loopback mapping preserved so host-side tooling (bench_qwen38_flash.py,
-      # healthcheck_qwen38_flash.sh) keeps working against 127.0.0.1:8000.
-      - "127.0.0.1:8000:8000"
-      # LAN mapping so Prometheus on 192.168.0.40 can scrape /metrics. NOTE: this
-      # also exposes the full OpenAI API (chat/completions, etc.) to the LAN - a
-      # deliberate trade-off chosen over a metrics-only reverse proxy.
-      - "192.168.0.96:8000:8000"
-    ipc: host
-    shm_size: 32gb
-    ulimits:
-      memlock: -1
-      nofile: 65535
-      stack: 67108864
-    # Eugr's launcher runs privileged; this is the documented non-privileged
-    # equivalent (with memlock above and /dev/infiniband below).
-    cap_add:
-      - IPC_LOCK
-    # REQUIRED: the B12x disk PLE reader (VLLM_PLE_TABLE_MEMORY=disk) does its
-    # scatter-gather reads through io_uring, and Docker's default seccomp profile
-    # blocks io_uring_setup -> "io_uring initialization failed: Operation not
-    # permitted" a few minutes into the weight load. Unconfining seccomp is what
-    # `--privileged` (Eugr's launcher default) gives you anyway; everything else
-    # here stays restricted, unlike --privileged.
-    security_opt:
-      - seccomp=unconfined
-    devices:
-      - /dev/infiniband:/dev/infiniband
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    volumes:
-      - /etc/passwd:/etc/passwd:ro
-      - /etc/group:/etc/group:ro
-      - /home/mcampa/.cache/huggingface:/cache/huggingface
-      # The upstream `flashnext-int4-b12x` mod, vendored: it builds the served-model
-      # views under /workspace/flashnext and patches this container's vLLM.
-      - ./mods/flashnext-int4-b12x:/workspace/mod:ro
-      # Chat templates. These are the checkpoints' own templates with one change:
-      # consecutive leading system messages are merged instead of raising. See
-      # chat-templates/ and the README.
-      - ./chat-templates:/workspace/chat-templates:ro
-      # The serve command. Read-only, and invoked via /bin/bash so the exec bit
-      # and bind-mount ownership don't matter.
-      - ./vllm-start-fast.sh:/workspace/vllm-start-fast.sh:ro
-    environment:
-      # --- B12x stack (Eugr's GB10 build) -------------------------------------
-      CUTE_DSL_ARCH: sm_121a
-      VLLM_WORKER_MULTIPROC_METHOD: spawn
-      VLLM_SSM_CONV_STATE_LAYOUT: DS
-      VLLM_USE_AOT_COMPILE: "1"
-      VLLM_USE_MEGA_AOT_ARTIFACT: "1"
-      VLLM_USE_V2_MODEL_RUNNER: "1"
-      B12X_POLICY_MODE: auto
-      # RoCE all-reduce. Carried over verbatim from the upstream solo recipe; inert
-      # on a single GB10 (there is no RDMA peer to reduce with).
-      VLLM_ENABLE_ROCE_ALLREDUCE: "1"
-      VLLM_ROCE_ALLREDUCE_MAX_SIZE: 2MB
-      # --- PLE n-gram table streamed from disk (the reason this fits one Spark) ---
-      VLLM_PLE_TABLE_MEMORY: disk
-      # --- this checkpoint: blockwise-fp8 side layers inside a GPTQ container ----
-      VLLM_FP8_HYBRID: "1"
-      VLLM_MARLIN_USE_ATOMIC_ADD: "1"
-      VLLM_USE_DEEP_GEMM: "0"
-      VLLM_USE_FLASHINFER_SAMPLER: "1"
-      # --- MTP draft: scale the draft's logits before the accept test ----------
-      VLLM_MTP_DRAFT_SCALE: "2"
-      # --- offline HF cache: weights live in the bind mount above --------------
-      HOME: /tmp
-      HF_HOME: /cache/huggingface
-      HF_HUB_CACHE: /cache/huggingface/hub
-      HF_HUB_OFFLINE: "1"
-      TRANSFORMERS_OFFLINE: "1"
-    # Replaces the image's ENTRYPOINT ["vllm","serve"] instead of appending to
-    # it. A script cannot go in `command:` - that entrypoint would prepend itself
-    # and yield argv "vllm serve /workspace/vllm-start-fast.sh".
-    entrypoint: ["/bin/bash", "/workspace/vllm-start-fast.sh"]
-    healthcheck:
-      # /health 200s only once weights are loaded - ~10-13 min cold.
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 1200s
+  ## --- ACTIVE: qwen38-fast - Qwen3.8-Flash-Next A5B INT4 AutoRound ------------
+  ## The 125B-A5B Intel AutoRound int4 requant (~33% faster decode than the full
+  ## NVFP4 model on this box) served by the current B12x stack. See
+  ## vllm-start-fast.sh for the serve flags and mods/flashnext-int4-b12x/ for the
+  ## model views + vLLM patches it applies at startup.
+  #vllm:
+  #  image: eugr/spark-vllm-b12x@sha256:8e7e062186f841453ef0ec6f713043c5b65447decc3835206685128c18e42262
+  #  restart: always
+  #  container_name: vllm-qwen38-flash
+  #  # On the compose bridge, deliberately NOT host networking. vLLM passes
+  #  # --host 0.0.0.0 inside its own network namespace; the published port below
+  #  # is what controls host/LAN reachability.
+  #  ports:
+  #    # Loopback mapping preserved so host-side tooling (bench_qwen38_flash.py,
+  #    # healthcheck_qwen38_flash.sh) keeps working against 127.0.0.1:8000.
+  #    - "127.0.0.1:8000:8000"
+  #    # LAN mapping so Prometheus on 192.168.0.40 can scrape /metrics. NOTE: this
+  #    # also exposes the full OpenAI API (chat/completions, etc.) to the LAN - a
+  #    # deliberate trade-off chosen over a metrics-only reverse proxy.
+  #    - "192.168.0.96:8000:8000"
+  #  ipc: host
+  #  shm_size: 32gb
+  #  ulimits:
+  #    memlock: -1
+  #    nofile: 65535
+  #    stack: 67108864
+  #  # Eugr's launcher runs privileged; this is the documented non-privileged
+  #  # equivalent (with memlock above and /dev/infiniband below).
+  #  cap_add:
+  #    - IPC_LOCK
+  #  # REQUIRED: the B12x disk PLE reader (VLLM_PLE_TABLE_MEMORY=disk) does its
+  #  # scatter-gather reads through io_uring, and Docker's default seccomp profile
+  #  # blocks io_uring_setup -> "io_uring initialization failed: Operation not
+  #  # permitted" a few minutes into the weight load. Unconfining seccomp is what
+  #  # `--privileged` (Eugr's launcher default) gives you anyway; everything else
+  #  # here stays restricted, unlike --privileged.
+  #  security_opt:
+  #    - seccomp=unconfined
+  #  devices:
+  #    - /dev/infiniband:/dev/infiniband
+  #  deploy:
+  #    resources:
+  #      reservations:
+  #        devices:
+  #          - driver: nvidia
+  #            count: all
+  #            capabilities: [gpu]
+  #  volumes:
+  #    - /etc/passwd:/etc/passwd:ro
+  #    - /etc/group:/etc/group:ro
+  #    - /home/mcampa/.cache/huggingface:/cache/huggingface
+  #    # The upstream `flashnext-int4-b12x` mod, vendored: it builds the served-model
+  #    # views under /workspace/flashnext and patches this container's vLLM.
+  #    - ./mods/flashnext-int4-b12x:/workspace/mod:ro
+  #    # Chat templates. These are the checkpoints' own templates with one change:
+  #    # consecutive leading system messages are merged instead of raising. See
+  #    # chat-templates/ and the README.
+  #    - ./chat-templates:/workspace/chat-templates:ro
+  #    # The serve command. Read-only, and invoked via /bin/bash so the exec bit
+  #    # and bind-mount ownership don't matter.
+  #    - ./vllm-start-fast.sh:/workspace/vllm-start-fast.sh:ro
+  #  environment:
+  #    # --- B12x stack (Eugr's GB10 build) -------------------------------------
+  #    CUTE_DSL_ARCH: sm_121a
+  #    VLLM_WORKER_MULTIPROC_METHOD: spawn
+  #    VLLM_SSM_CONV_STATE_LAYOUT: DS
+  #    VLLM_USE_AOT_COMPILE: "1"
+  #    VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  #    VLLM_USE_V2_MODEL_RUNNER: "1"
+  #    B12X_POLICY_MODE: auto
+  #    # RoCE all-reduce. Carried over verbatim from the upstream solo recipe; inert
+  #    # on a single GB10 (there is no RDMA peer to reduce with).
+  #    VLLM_ENABLE_ROCE_ALLREDUCE: "1"
+  #    VLLM_ROCE_ALLREDUCE_MAX_SIZE: 2MB
+  #    # --- PLE n-gram table streamed from disk (the reason this fits one Spark) ---
+  #    VLLM_PLE_TABLE_MEMORY: disk
+  #    # --- this checkpoint: blockwise-fp8 side layers inside a GPTQ container ----
+  #    VLLM_FP8_HYBRID: "1"
+  #    VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  #    VLLM_USE_DEEP_GEMM: "0"
+  #    VLLM_USE_FLASHINFER_SAMPLER: "1"
+  #    # --- MTP draft: scale the draft's logits before the accept test ----------
+  #    VLLM_MTP_DRAFT_SCALE: "2"
+  #    # --- offline HF cache: weights live in the bind mount above --------------
+  #    HOME: /tmp
+  #    HF_HOME: /cache/huggingface
+  #    HF_HUB_CACHE: /cache/huggingface/hub
+  #    HF_HUB_OFFLINE: "1"
+  #    TRANSFORMERS_OFFLINE: "1"
+  #  # Replaces the image's ENTRYPOINT ["vllm","serve"] instead of appending to
+  #  # it. A script cannot go in `command:` - that entrypoint would prepend itself
+  #  # and yield argv "vllm serve /workspace/vllm-start-fast.sh".
+  #  entrypoint: ["/bin/bash", "/workspace/vllm-start-fast.sh"]
+  #  healthcheck:
+  #    # /health 200s only once weights are loaded - ~10-13 min cold.
+  #    test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+  #    interval: 30s
+  #    timeout: 10s
+  #    retries: 3
+  #    start_period: 1200s
 
   # --- ALTERNATIVE: qwen38 - full Qwen3.8-Flash-Next NVFP4 --------------------
   # The 125B-A6B NVIDIA ModelOpt NVFP4 checkpoint, served with the b12x loader.
@@ -255,63 +255,63 @@ services:
   # switches back. The checkpoint is a separate ~98 GiB download and the first boot
   # writes a ~31 GiB table map, so give it ~130 GB of NVMe; see the README.
   #
-  # vllm:
-  #   image: myllmbox/qwen38-flash-next-vllm@sha256:51629f438f5ba3f7a96db110826c783d69b91a6851c43fb07d447644f157dcc4
-  #   restart: always
-  #   container_name: vllm-qwen38-flash
-  #   ports:
-  #     - "127.0.0.1:8000:8000"
-  #     - "192.168.0.96:8000:8000"
-  #   ipc: host
-  #   shm_size: 32gb
+  vllm:
+    image: myllmbox/qwen38-flash-next-vllm@sha256:51629f438f5ba3f7a96db110826c783d69b91a6851c43fb07d447644f157dcc4
+    restart: always
+    container_name: vllm-qwen38-flash
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "192.168.0.96:8000:8000"
+    ipc: host
+    shm_size: 32gb
   #   # Upstream's cpuset: the GB10's ten 3.9GHz Cortex-X925 cores (0-4 and 10-14 are
   #   # 2.8GHz A725). Worth a couple of percent; drop it to let the scheduler place this
   #   # alongside the other containers instead.
-  #   cpuset: "5-9,15-19"
-  #   ulimits:
-  #     nofile: 65535
+    cpuset: "5-9,15-19"
+    ulimits:
+      nofile: 65535
   #   # REQUIRED: the image's NVMe table reader uses io_uring, and Docker's default
   #   # seccomp profile blocks io_uring_setup. Upstream passes the same thing via
   #   # docker_args, and still runs the container unprivileged.
-  #   security_opt:
-  #     - seccomp=unconfined
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   volumes:
+    security_opt:
+      - seccomp=unconfined
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
   #     # The checkpoint, ~98 GiB - a real directory from `hf download --local-dir`, not
   #     # the shared HF cache the other backends use. Read-write, as in the upstream kit.
-  #     - /models/qwen38/models:/models
+      - /models/qwen38/models:/models
   #     # MUST be writable and MUST be NVMe: the first boot prepares the ~31 GiB table map
   #     # here (a few minutes, once) and every later request reads it. On tmpfs it would be
   #     # rebuilt on every boot and eat the unified memory this is meant to free.
-  #     - /models/qwen38/cache:/cache
+      - /models/qwen38/cache:/cache
   #     # Our chat template: the checkpoint's own with leading system messages merged -
   #     # see chat-templates/ and the README.
-  #     - ./chat-templates:/workspace/chat-templates:ro
-  #     - ./vllm-start-hibrid48.sh:/workspace/vllm-start-hibrid48.sh:ro
-  #   environment:
+      - ./chat-templates:/workspace/chat-templates:ro
+      - ./vllm-start-hibrid48.sh:/workspace/vllm-start-hibrid48.sh:ro
+    environment:
   #     # --- the image's table reader, demand-paging the n-gram table from /cache -----
-  #     MBX_PLE_MMAP: "1"
-  #     MBX_PLE_MMAP_MODE: nvme
-  #     MBX_PLE_MMAP_PREWARM: "0"
-  #     VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
-  #     VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+      MBX_PLE_MMAP: "1"
+      MBX_PLE_MMAP_MODE: nvme
+      MBX_PLE_MMAP_PREWARM: "0"
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+      VLLM_MARLIN_USE_ATOMIC_ADD: "1"
   #     # --- the recipe's env ---------------------------------------------------------
-  #     TORCH_CUDA_ARCH_LIST: "12.1a"
-  #     FLASHINFER_CUDA_ARCH_LIST: "12.1a"
-  #     PYTHONUNBUFFERED: "1"
+      TORCH_CUDA_ARCH_LIST: "12.1a"
+      FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+      PYTHONUNBUFFERED: "1"
   #     # glibc hands big freed blocks back to the OS at once; without this the loader's
   #     # garbage stays resident and swaps.
-  #     MALLOC_MMAP_THRESHOLD_: "65536"
-  #     MALLOC_TRIM_THRESHOLD_: "131072"
+      MALLOC_MMAP_THRESHOLD_: "65536"
+      MALLOC_TRIM_THRESHOLD_: "131072"
   #     # --- writable state, all under the /cache mount ---------------------------------
-  #     VLLM_CACHE_ROOT: /cache/vllm-cache
-  #     FLASHINFER_WORKSPACE_BASE: /cache/flashinfer-workspace
+      VLLM_CACHE_ROOT: /cache/vllm-cache
+      FLASHINFER_WORKSPACE_BASE: /cache/flashinfer-workspace
   #     # Triton keeps its own cache and does NOT read VLLM_CACHE_ROOT. Unset, it writes
   #     # $HOME/.triton/cache and HOME is /root - inside the image layer - so every
   #     # recreate discards ~100 MB of compiled kernels and the next requests rebuild
@@ -320,17 +320,17 @@ services:
   #     # window that logged those saw 26-46 s requests (prefill-bound) against 4-9 s for
   #     # the same shape afterwards. Pointing it at /cache makes the compile one-off
   #     # instead of once per container.
-  #     TRITON_CACHE_DIR: /cache/triton
+      TRITON_CACHE_DIR: /cache/triton
   #     # --- nothing is fetched at runtime --------------------------------------------
-  #     HF_HUB_OFFLINE: "1"
-  #     TRANSFORMERS_OFFLINE: "1"
-  #   entrypoint: ["/bin/bash", "/workspace/vllm-start-hibrid48.sh"]
-  #   healthcheck:
-  #     test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 1200s
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    entrypoint: ["/bin/bash", "/workspace/vllm-start-hibrid48.sh"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 1200s
 
   # --- Observability sidecars: scraped by Prometheus on 192.168.0.40 ---
 
