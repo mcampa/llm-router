@@ -74,6 +74,7 @@ working. Expect ~10–15 minutes of weight loading after either switch.
 |---|---|---|
 | `local` | `qwen3.8-flash-next` | self-hosted vLLM, over the compose network |
 | `deepseek` | `deepseek-flash`, then `local` | DeepSeek cloud API; falls back to vLLM |
+| `deepseek-cloud` | `deepseek-flash` | DeepSeek cloud API; no fallback, at most 4 in flight |
 
 Both are defined in `config.yaml` as `model_name` aliases. Callers only ever name the
 alias. `local` is stable across a backend switch, and the upstream model id
@@ -83,7 +84,18 @@ config change.
 `deepseek` has a LiteLLM model-group fallback to `local`. If the cloud key is out of
 balance, times out, or returns 5xx, the proxy retries on vLLM and the client still sees
 `model: deepseek`. After one failure the cloud deployment is cooled down for 300s so later
-turns skip the dead round trip. Restart `litellm` after editing `config.yaml`
+turns skip the dead round trip. The cloud deployment has `timeout: 120` and
+`stream_timeout: 60`, so a DeepSeek that accepts connections but never answers also fails
+over instead of hanging.
+
+`deepseek-cloud` is for background callers such as Hindsight. When DeepSeek is down its
+requests fail, and the caller retries later, instead of falling back to `local` and
+queueing ahead of interactive turns.
+
+LiteLLM does not cancel the upstream request when a client disconnects. The timeouts on
+both deployments bound how long an abandoned request can hold a vLLM slot. If vLLM shows a
+deep queue while litellm has few client connections, those are abandoned requests;
+`docker compose restart litellm` drops them. Restart `litellm` after editing `config.yaml`
 (`docker compose restart litellm`).
 
 The Admin UI play button on Router Settings → Fallbacks sends `mock_testing_fallbacks`.
