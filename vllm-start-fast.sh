@@ -77,8 +77,10 @@ fi
 
 # --- 4. serve ------------------------------------------------------------------
 # --gpu-memory-utilization 0.01 is deliberate: the KV pool is sized by
-# --kv-cache-memory-bytes (20g ~= 645k tokens) and the rest of the unified memory is
-# left to the rest of the box.
+# --kv-cache-memory-bytes (20g) and the rest of the unified memory is left to the rest of
+# the box. KV is fp8, which halves the per-token cost, so that same 20g holds ~1.29M tokens
+# rather than ~645k. That buys concurrency and prefix-cache retention, not a longer single
+# request - --max-model-len 262144 is that ceiling.
 #
 # MTP stays at 4 on block-size 16 by choice. The vendored mod's mtp-cap patch does raise QSA's cap
 # to 7, but depth 5+ needs the upstream recipe's block_size 1632 (its 12-row QSA ring must divide
@@ -99,7 +101,7 @@ exec vllm serve "$OUT/model" \
   --enable-prefix-caching \
   --enable-chunked-prefill \
   --dtype bfloat16 \
-  --kv-cache-dtype auto \
+  --kv-cache-dtype fp8 \
   --block-size 16 \
   --load-format fastsafetensors \
   --max-model-len 262144 \
