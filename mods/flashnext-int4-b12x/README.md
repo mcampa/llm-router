@@ -3,7 +3,7 @@
 Makes Eugr's `vllm-node-b12x` image able to serve
 `azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`.
 
-Copied verbatim from:
+Vendored from, with one local delta (marked `LOCAL DELTA` in the source):
 
 - repo: <https://github.com/azampatti/Qwen3.8-Flash-Next-Int4-FAST>
 - commit: `73c4fa07bddd5f4ae04c3384973ab5b4c4b61a80` (2026-10-06)
@@ -12,7 +12,7 @@ Copied verbatim from:
 | File | Role |
 |---|---|
 | `build_views.py` | builds `/workspace/flashnext/model` (served view: PLE table indexed, b12x config fields) and `/workspace/flashnext/draft-k10` (slim MTP draft folder, top-k 10) out of symlinks — nothing is copied |
-| `patch_b12x.py` | patches the container's vLLM: fp8-hybrid quant config, int4 lm_head, index filter for the mixed PLE files, draft-scale, MTP cap, request-default penalties, drafter pad rows, GDN fixes. Idempotent (`flashnext-int4-b12x:` marker comments), and every edit is checked before it is written |
+| `patch_b12x.py` | patches the container's vLLM: fp8-hybrid quant config, int4 lm_head, index filter for the mixed PLE files, draft-scale, MTP cap, request-default penalties, drafter pad rows (**required here**, see Local delta), GDN fixes. Idempotent (`flashnext-int4-b12x:` marker comments), and every edit is checked before it is written |
 | `vllm_fp8_hybrid.py` | the fp8-hybrid hook that `patch_b12x.py` installs into site-packages |
 
 The upstream `run.sh` is **not** vendored: it hardcodes the container path
@@ -24,6 +24,20 @@ snapshot, build the views, patch vLLM) against the mount this repo uses.
 checkpoint under its own name (`--served-model-name azampatti/Qwen3.8-Flash-Next-125B-A5B-...`).
 Here it is served as `qwen3.8-flash-next` so that both backends present the same model id and
 LiteLLM's `config.yaml` never changes when you switch.
+
+## Local delta
+
+`patch_b12x.py` is upstream's file plus one deliberate change, marked in-source with `LOCAL DELTA`:
+
+- **`drafter-pad-rows` is `required=True` here; upstream ships it `False`.** Upstream marks it
+  optional because the anchor may be absent from some images, so a miss degrades to a warning —
+  but for this repo that patch *is* the reason for the vendored revision, and its failure mode is
+  quiet (one stream at ~1 token/step, output still correct, so it reads as unexplained slowness).
+  Booting without it is worse than not booting. The replacement also accepts an image carrying
+  upstream's own fix without our marker, so a newer image that genuinely fixes this does not
+  abort the launch.
+
+Everything else in the three files is verbatim.
 
 ## Upstream recipe knobs this repo does not take
 
@@ -43,9 +57,10 @@ inexplicable slowness). It edits `qsa.py` in the container and needs no recipe c
 
 ## Updating
 
-Re-pull the three files at a newer upstream commit and update the commit hash above. Check
-them against the running container before trusting a new revision: `patch_b12x.py`'s
-*required* patches fail loudly (non-zero exit, launch aborted) if an anchor has moved, but its
-*optional* ones fall through with a warning — that is the case that can look like success.
-Confirm the marker you care about shows up in the launch log's `patched: ...` list rather than
-its `WARNING (optional, skipped): ...` list.
+Re-pull the three files at a newer upstream commit and update the commit hash above, then
+re-apply the local delta — a straight re-pull would silently revert `drafter-pad-rows` to
+optional. Check a new revision against the running container before trusting it:
+`patch_b12x.py`'s *required* patches fail loudly (non-zero exit, launch aborted) if an anchor
+has moved, while its *optional* ones fall through with a warning — that is the case that can
+look like success. Confirm the marker you care about shows up in the launch log's `patched: ...`
+list rather than its `WARNING (optional, skipped): ...` list.

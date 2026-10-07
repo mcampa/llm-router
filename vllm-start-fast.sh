@@ -62,7 +62,11 @@ python3 "$MOD_DIR/patch_b12x.py" "$MOD_DIR" || die "could not patch vLLM"
 # --- 4. serve ------------------------------------------------------------------
 # --gpu-memory-utilization 0.01 is deliberate: the KV pool is sized by
 # --kv-cache-memory-bytes (20g ~= 645k tokens) and the rest of the unified memory is
-# left to the rest of the box. QSA refuses num_speculative_tokens > 4.
+# left to the rest of the box.
+#
+# MTP stays at 4 on block-size 16 by choice. The vendored mod's mtp-cap patch does raise QSA's cap
+# to 7, but depth 5+ needs the upstream recipe's block_size 1632 (its 12-row QSA ring must divide
+# the page), so depths above 4 are not enabled here.
 #
 # exec so vLLM becomes PID 1 and receives SIGTERM from `docker stop` directly.
 exec vllm serve "$OUT/model" \
