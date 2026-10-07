@@ -55,9 +55,25 @@ python3 "$MOD_DIR/build_views.py" "$SNAP" "$OUT" || die "could not build the mod
 
 # --- 3. patch this container's vLLM --------------------------------------------
 # Required: fp8-hybrid quant config, int4 lm_head, index filter for the mixed PLE
-# files. Optional: draft x2, GDN fixes (warns and continues). Exits non-zero if a
-# required patch cannot be applied - better to abort than to serve a broken model.
+# files. Optional: draft x2, MTP cap, penalties, pad rows, GDN fixes (each warns and
+# continues). Exits non-zero if a required patch cannot be applied - better to abort
+# than to serve a broken model.
 python3 "$MOD_DIR/patch_b12x.py" "$MOD_DIR" || die "could not patch vLLM"
+
+# The vendored patch_b12x.py is kept byte-for-byte upstream, where the pad-rows patch is
+# *optional*: if its anchor moves, the launch only warns and carries on without it. That is
+# the one patch this repo is on this revision for, and its failure is quiet - one stream
+# drops to ~1 token/step while its output stays correct, so it reads as unexplained
+# slowness rather than as a bug. Assert the container's qsa.py really carries the fix
+# instead of trusting the patch script's exit status. Booting without it would be worse
+# than not booting: config.yaml falls local -> deepseek, so an aborted launch degrades to
+# the cloud route rather than going dark.
+# The second alternative accepts an image that fixes this upstream without our marker.
+if ! grep -rqE --include=qsa.py \
+      'self\._request_ids\[num_mapped_tokens:\]\.fill_\(-1\)|flashnext-int4-b12x:drafter-pad-rows' \
+      /usr/local/lib/python3.*/dist-packages/vllm/models; then
+  die "drafter-pad-rows fix absent from the container's qsa.py (anchor moved upstream?)"
+fi
 
 # --- 4. serve ------------------------------------------------------------------
 # --gpu-memory-utilization 0.01 is deliberate: the KV pool is sized by

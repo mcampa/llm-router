@@ -209,21 +209,11 @@ for _proto in ("chat_completion", "completion"):
 # extra rows read the QSA builder's request-id buffer past the step's tokens. Stock code cleared that tail only when the step itself
 # was padded, so the rows kept the previous prefill step's request index; b12x's QSA validation then charged that request (error 128),
 # skipped its ring commit and NaN-poisoned it: 1 token/step until the request ended (parallel agents hit it constantly).
-#
-# LOCAL DELTA (upstream passes False here): this one is REQUIRED. It is the entire reason this repo is on this
-# revision, and the failure it prevents is quiet -- one stream drops to ~1 token/step for the rest of the request
-# while its output stays correct, which reads as unexplained slowness rather than as a bug. Booting without it
-# would be worse than not booting. The branch below also accepts an image that carries upstream's own fix
-# without our marker, so a newer image that genuinely fixes this does not abort the launch.
-def _drafter_pad_rows(s):
-    fixed = "self._request_ids[num_mapped_tokens:].fill_(-1)"
-    if fixed in s:
-        return s + f"\n# {MARK}:drafter-pad-rows (already fixed upstream)\n"
-    return once(s, "        if num_mapped_tokens < cm.num_actual_tokens:\n            request_ids[num_mapped_tokens:].fill_(-1)\n",
-                f"        {fixed}  # {MARK}:drafter-pad-rows (clear the whole unused tail)\n")
-
 _qsa = next((p for p in (f"{MODEL_DIR}/nvidia/qsa.py", f"{MODEL_DIR}/qsa.py") if os.path.isfile(p)), f"{MODEL_DIR}/nvidia/qsa.py")
-edit(_qsa, _drafter_pad_rows, "drafter-pad-rows", True)
+edit(_qsa,
+     lambda s: once(s, "        if num_mapped_tokens < cm.num_actual_tokens:\n            request_ids[num_mapped_tokens:].fill_(-1)\n",
+                    f"        self._request_ids[num_mapped_tokens:].fill_(-1)  # {MARK}:drafter-pad-rows (clear the whole unused tail)\n"),
+     "drafter-pad-rows", False)
 
 print("patched: " + ", ".join(done) + ("" if not warn else " | WARNING (optional, skipped): " + "; ".join(warn)))
 if fatal:
