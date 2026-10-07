@@ -114,6 +114,10 @@ services:
       # Compile caches, the draft folder, and this checkpoint's own fp8 n-gram table
       # map (~52G, built on the first boot of this backend).
       - /models/qwen38/cache:/cache
+      # Chat templates. `qwen38-fast-medium.jinja` is passed explicitly by the script: the
+      # recipe passes none, so the checkpoint's own template would 400 on the consecutive
+      # leading system messages this repo's harnesses emit. See the note in the script.
+      - ./chat-templates:/workspace/chat-templates:ro
       - ./vllm-start-myllmbox.sh:/workspace/vllm-start-myllmbox.sh:ro
     environment:
       # --- PLE n-gram table demand-paged from NVMe (the image's own reader) -----

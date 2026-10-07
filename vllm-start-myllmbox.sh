@@ -88,13 +88,17 @@ printf '{"mode": "dynamic", "min": 3, "window": 48, "promote": [60, 45], "demote
 export MBX_PLE_FP8_DIR="$SNAP/ple-table"
 export MBX_PLE_NVME_DIR="$CACHE/ple-nvme-fp8"
 
-# NOTE - this backend runs the checkpoint's own chat template, so unlike qwen38-fast it
-# does NOT apply this repo's leading-system-message merge, and reasoning effort keeps the
-# checkpoint's default rather than `medium`. Two consequences if this is ever promoted to
-# the active service: a harness that emits two leading system messages gets an HTTP 400
-# (our patch exists for exactly that), and the checkpoint default spends more thinking
-# tokens than qwen38-fast does. Either mount qwen38-fast-medium.jinja with --chat-template,
-# or pass --default-chat-template-kwargs '{"reasoning_effort":"medium"}', before switching.
+# Third departure from the recipe, and the reason this backend is usable behind this repo's
+# harnesses at all: myllmbox passes no --chat-template, so the checkpoint's own template
+# applies. Two things follow, and this repo has already fixed both once for qwen38-fast:
+#   * OpenCode + Hindsight emit two {role:system} blocks, which the checkpoint's template
+#     rejects with "System message must be at the beginning." (HTTP 400);
+#   * the checkpoint default is not `medium`, so reasoning effort - and with it the thinking
+#     budget - differs from every other backend here.
+# qwen38-fast-medium.jinja is this repo's copy of the checkpoint's medium template with the
+# leading-system-message merge applied, so it answers both while rendering byte-identically
+# to upstream for a single leading system message. Passing it is a deliberate departure from
+# the recipe, taken because the alternative is a backend that 400s on this repo's own clients.
 #
 # --gpu-memory-utilization 0.70 is the recipe's; with --kv-cache-memory pinned it does not
 # size the KV pool. exec so vLLM is PID 1 and gets SIGTERM from `docker stop` directly.
@@ -116,6 +120,7 @@ exec vllm serve "$SNAP" \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_xml \
   --reasoning-parser qwen3 \
+  --chat-template /workspace/chat-templates/qwen38-fast-medium.jinja \
   --async-scheduling \
   --use-replayssm \
   --compilation-config '{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,10,12,14,15,16,18,20,21,24,25,28,30,32,35,36,40,42,44,45,48,49,50,52,54,55,56,60,63,64,65,66,70,72,75,77,78,80,84,88,90,91,96,98,104,105,112,120,128],"compile_ranges_endpoints":[32]}' \
