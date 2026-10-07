@@ -4,9 +4,11 @@ A local LLM gateway for the DGX Spark. One OpenAI-compatible endpoint on port `4
 that routes to a self-hosted vLLM model and to DeepSeek's cloud API, with Postgres-backed
 model storage and Redis-backed caching.
 
-The self-hosted side runs **Eugr's B12x vLLM stack** on one GB10, and can serve either of
-two Qwen3.8-Flash-Next checkpoints. `qwen38-fast` is enabled; `qwen38` (full NVFP4) is
-staged in `docker-compose.yml`, commented out.
+The self-hosted side runs on one GB10 and can serve three staged backends. `qwen38-fast`
+(Eugr's B12x stack) and `qwen38` (full NVFP4) share one image; `qwen38-myllmbox` runs
+myllmbox's v5.2 image and serves the **same checkpoint as `qwen38-fast`** on a different
+engine. `qwen38-myllmbox` is enabled; the other two are staged in `docker-compose.yml`,
+commented out.
 
 ## Architecture
 
@@ -27,24 +29,28 @@ comment in `docker-compose.yml` if you want to revisit it.
 
 ## Backends
 
-Both backends are the same Compose service name (`vllm`), on the same ports, serving the
-same `--served-model-name qwen3.8-flash-next`. LiteLLM reaches them at
-`http://vllm:8000/v1` either way, so **nothing outside `docker-compose.yml` changes when
-you switch** — not `config.yaml`, not the `local` alias, not any caller.
+All three backends use the same Compose service name (`vllm`), the same ports, and the same
+`--served-model-name qwen3.8-flash-next`. LiteLLM reaches them at `http://vllm:8000/v1`
+either way, so **nothing outside `docker-compose.yml` changes when you switch** — not
+`config.yaml`, not the `local` alias, not any caller.
 
-| | `qwen38-fast` (enabled) | `qwen38` (commented out) |
-|---|---|---|
-| Checkpoint | `azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound` | `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` |
-| Quantisation | Intel AutoRound int4 + blockwise-fp8 side layers | NVIDIA ModelOpt NVFP4 (`modelopt_mixed`) |
-| Shape | 125B total, ~5 of 10 routed experts per token | 125B total, 10 experts per token |
-| Weights on disk | ~119 GiB | ~124 GiB |
-| KV cache | pinned `20g` (`--kv-cache-memory-bytes`), ~645k tokens | sized from `--gpu-memory-utilization 0.8`, fp8 |
-| Decode (this box) | ~33% faster than the full model | baseline |
-| Deterministic at T=0 | no | yes |
-| Startup script | `vllm-start-fast.sh` | `vllm-start-full.sh` |
-| Extra pieces | the vendored `mods/flashnext-int4-b12x/` | none |
+| | `qwen38-myllmbox` (enabled) | `qwen38-fast` (commented out) | `qwen38` (commented out) |
+|---|---|---|---|
+| Checkpoint | `azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound` | **same checkpoint** | `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` |
+| Image | `myllmbox/qwen38-flash-next-vllm:v5.2`, vLLM 0.30.0 + in-tree patches | `eugr/spark-vllm-b12x`, vLLM 0.1.dev20759 | same as fast |
+| Quantisation | Intel AutoRound int4, fp8 side layers, fp8 n-gram table | same | NVIDIA ModelOpt NVFP4 (`modelopt_mixed`) |
+| Weights on disk | ~119 GiB | ~119 GiB | ~124 GiB |
+| KV cache | pinned `24000000000`, bf16 | pinned `20g`, bf16 | sized from `--gpu-memory-utilization 0.8`, fp8 |
+| Speculative | MTP, **dynamic depth 3–7** + RecoverSSM, `block_size 1632` | MTP 4 fixed, `block_size 16` | MTP 5 |
+| Startup script | `vllm-start-myllmbox.sh` | `vllm-start-fast.sh` | `vllm-start-full.sh` |
+| Extra pieces | none (patches are in the image) | the vendored `mods/flashnext-int4-b12x/` | none |
 
 Only one may run at a time — they would fight for the GPU and port 8000.
+
+`qwen38-myllmbox` and `qwen38-fast` serve the **same checkpoint**, so they differ by engine
+and settings rather than by model — that is what makes a like-for-like comparison possible.
+`vllm-start-myllmbox.sh` transcribes `recipe.yaml` at v5.2 plus the INT4-AutoRound profile
+myllmbox's `run.sh` applies on top of it, and names its departures.
 
 > `qwen38` uses `local-inference-lab/…`, **not** the `nvidia/Qwen3.8-Flash-Next-NVFP4`
 > checkpoint. No current B12x recipe targets the `nvidia` layout; Eugr's recipe serves the
@@ -52,21 +58,34 @@ Only one may run at a time — they would fight for the GPU and port 8000.
 > modelopt_mixed` expect. If you have `nvidia/…` in your cache from the old stack, it will
 > not be reused.
 
-### Switching to the full NVFP4 model
+### Switching backends
+
+Exactly one `vllm:` block is uncommented at a time.
 
 ```bash
-# 1. In docker-compose.yml: comment out the "ACTIVE: qwen38-fast" service and
-#    delete the leading '#' from the "ALTERNATIVE: qwen38" block.
+# 1. In docker-compose.yml: comment the active block, uncomment the target one.
 # 2. Make sure its checkpoint is cached (see Prerequisites).
-# 3. Recreate the backend:
+# 3. Recreate - not `restart`, which re-runs the same container and these differ by image:
 docker compose up -d --remove-orphans
-
-# back to fast: reverse step 1 and re-run the same command
 ```
 
-Both blocks use `container_name: vllm-qwen38-flash`, so the switch is a plain recreate —
-no container-name conflicts, and host tooling that targets the container by name keeps
-working. Expect ~10–15 minutes of weight loading after either switch.
+All three use `container_name: vllm-qwen38-flash`, so the switch is a plain recreate — no
+container-name conflicts, and host tooling that targets the container by name keeps
+working.
+
+Expect ~10–15 minutes of weight loading. `qwen38-myllmbox` adds a one-time table map build
+(~52 GB for the INT4 checkpoint, ~31 GB for the NVFP4 one) on its first boot of a given
+checkpoint; it lands under `cache/` and is reused afterwards, so that first start is the
+slowest of the three.
+
+> **Before promoting `qwen38-myllmbox` to the only backend**, note that unlike
+> `qwen38-fast` it passes no `--chat-template`, matching myllmbox's recipe exactly. The
+> checkpoint's own template then applies, which means two things this repo has otherwise
+> already handled: a harness that emits two leading system messages gets an HTTP 400 (the
+> case `qwen38-fast-medium.jinja` exists to merge), and reasoning effort keeps the
+> checkpoint's default rather than `medium`. Mount the template with `--chat-template`, or
+> pass `--default-chat-template-kwargs '{"reasoning_effort":"medium"}'`, before switching.
+> `vllm-start-myllmbox.sh` carries the same note at the serve line.
 
 ## Model routes
 
@@ -106,8 +125,9 @@ be true in `config.yaml` (it cannot be flipped from the UI).
 
 | File | Purpose |
 |---|---|
-| `docker-compose.yml` | the services, and the two alternative `vllm` backends |
+| `docker-compose.yml` | the services, and the three alternative `vllm` backends |
 | `config.yaml` | model routing, Redis cache, router settings |
+| `vllm-start-myllmbox.sh` | serve `qwen38-myllmbox` (myllmbox v5.2, same checkpoint as fast) |
 | `vllm-start-fast.sh` | build the model views, patch vLLM, serve `qwen38-fast` |
 | `vllm-start-full.sh` | serve `qwen38` (used only when that block is enabled) |
 | `mods/flashnext-int4-b12x/` | vendored upstream mod: model views + vLLM patches for the A5B checkpoint |
