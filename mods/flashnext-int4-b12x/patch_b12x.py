@@ -14,8 +14,15 @@ never modified -- a new container starts clean and the mod re-applies this.
                  original layer-1 weights sitting in two PLE-table files over V8's healed ones.
   OPTIONAL (a warning, the launch goes on):
     draft x2     VLLM_MTP_DRAFT_SCALE scales the draft's logits (exact: the verifier decides) -- +2.5pp acceptance.
+    mtp-cap      lets b12x's QSA take up to 7 speculative tokens (stock cap 4); the solo recipe runs 5.
     GDN fixes    spark-fla-shmem (GB10 gets the big GDN tiles) and spark-fla-warps (num_warps=2: fla#953 Blackwell race
                  that corrupts GDN state on the prefix-cache path), same one-liners as the qwen38-flash-dgx image.
+    penalties    server-default presence/frequency penalty from --override-generation-config (stock vLLM drops both
+                 keys, and requests default them to 0.0); a request that sets the field keeps its own value.
+    pad rows     dead MTP drafter under concurrency: the QSA metadata builder clears the whole unused tail of its request-id
+                 buffer every step, so the drafter's padded graph rows (request counts not in {1,2,4,8,16}) never carry a
+                 stale request index (b12x QSA error 128 -> ring commit skipped, NaN-poisoned, 1 token/step for the rest of
+                 the request). Prunning/qwen38_flash_next/mtp_sweep/ROOTCAUSE.md.
 
   usage: patch_b12x.py <mod dir>
 """
@@ -152,6 +159,23 @@ def _scale(s):
                    f'scale=float(__import__("os").environ.get("VLLM_MTP_DRAFT_SCALE", "1.0")),  # {MARK}:draft-scale\n', s)
 edit(f"{MODEL_DIR}/mtp.py", _scale, "draft-scale", False)
 
+# 6. MTP depth up to 7 --------------------------------------------------------------------------------------------------
+# b12x's QSA refuses more than 4 speculative tokens (_QSA_MAX_SPECULATIVE_TOKENS = 4). At depth 5-7 its raw ring is 12 rows
+# (4 * ceil((4 + K) / 4)) and the b12x kernels take the ring size as a parameter; the only extra requirement is a page size
+# that 12 divides, which the solo recipe's block_size 1632 gives (1632 = 12 * 136 = 8 * 204). Depth 8 is refused further
+# down by b12x's GDN plan (state_index_columns = K + 1 <= 8), hence 7. Only the cap moves: nothing changes at depth <= 4.
+# Measured 2026-09-27 on the pinned 09-13 image: depth 5 = +4 % run.py tok/s over depth 4, same quality.
+def _mtp_cap(s):
+    m = re.search(r"^_QSA_MAX_SPECULATIVE_TOKENS = (\d+)$", s, re.M)
+    if not m:
+        return None
+    if int(m.group(1)) >= 7:
+        return s + f"\n# {MARK}:mtp-cap (this image already allows {m.group(1)})\n"
+    return s.replace(m.group(0), f"_QSA_MAX_SPECULATIVE_TOKENS = 7  # {MARK}:mtp-cap (was {m.group(1)})")
+_qsa = next((p for p in (f"{MODEL_DIR}/nvidia/qsa.py", f"{MODEL_DIR}/qsa.py")
+             if os.path.isfile(p) and "_QSA_MAX_SPECULATIVE_TOKENS" in open(p).read()), f"{MODEL_DIR}/nvidia/qsa.py")
+edit(_qsa, _mtp_cap, "mtp-cap", False)
+
 # 5. GDN fixes ---------------------------------------------------------------------------------------------------------
 fla = f"{V}/third_party/flash_linear_attention/ops"
 edit(f"{fla}/utils.py", lambda s: once(s, "DEFAULT = 102400", f"DEFAULT = 101376  # {MARK}:fla-shmem GB10 99KiB"),
@@ -159,6 +183,37 @@ edit(f"{fla}/utils.py", lambda s: once(s, "DEFAULT = 102400", f"DEFAULT = 101376
 edit(f"{fla}/chunk_delta_h.py",
      lambda s: once(s, "for num_warps in [2, 4]", f"for num_warps in [2]  # {MARK}:fla-warps fla#953"),
      "fla-warps", False)
+
+# 7. server-default presence/frequency penalty ------------------------------------------------------------------------
+# vLLM takes server-wide sampling defaults from --override-generation-config only for temperature/top_p/top_k/min_p/
+# repetition_penalty, and the OpenAI requests default presence_penalty to 0.0, so a server default never applies. Recipes
+# set --override-generation-config '{"presence_penalty":0.5}' against looping thinking blocks: let that key through and use
+# it when the request does not set the field itself (a request that sends presence_penalty, even 0, keeps its own value).
+edit(f"{V}/config/model.py",
+     lambda s: once(s, '            "min_p",\n            "max_new_tokens",\n',
+                    '            "min_p",\n            "max_new_tokens",\n'
+                    f'            "presence_penalty",  # {MARK}:default-penalties\n            "frequency_penalty",\n'),
+     "default-penalties", False)
+for _proto in ("chat_completion", "completion"):
+    edit(f"{V}/entrypoints/openai/{_proto}/protocol.py",
+         lambda s: once(s, "            presence_penalty=self.presence_penalty,\n"
+                           "            frequency_penalty=self.frequency_penalty,\n",
+                        f"            presence_penalty=(self.presence_penalty if 'presence_penalty' in self.model_fields_set  # {MARK}:request-penalty-default\n"
+                        "                else default_sampling_params.get('presence_penalty', self.presence_penalty)),\n"
+                        "            frequency_penalty=(self.frequency_penalty if 'frequency_penalty' in self.model_fields_set\n"
+                        "                else default_sampling_params.get('frequency_penalty', self.frequency_penalty)),\n"),
+         f"request-penalty-default", False)
+
+# 8. drafter pad rows ----------------------------------------------------------------------------------------------------
+# The MTP drafter's step-0 graphs exist only for {1,2,4,8,16} requests; a decode step with another count replays a padded graph whose
+# extra rows read the QSA builder's request-id buffer past the step's tokens. Stock code cleared that tail only when the step itself
+# was padded, so the rows kept the previous prefill step's request index; b12x's QSA validation then charged that request (error 128),
+# skipped its ring commit and NaN-poisoned it: 1 token/step until the request ended (parallel agents hit it constantly).
+_qsa = next((p for p in (f"{MODEL_DIR}/nvidia/qsa.py", f"{MODEL_DIR}/qsa.py") if os.path.isfile(p)), f"{MODEL_DIR}/nvidia/qsa.py")
+edit(_qsa,
+     lambda s: once(s, "        if num_mapped_tokens < cm.num_actual_tokens:\n            request_ids[num_mapped_tokens:].fill_(-1)\n",
+                    f"        self._request_ids[num_mapped_tokens:].fill_(-1)  # {MARK}:drafter-pad-rows (clear the whole unused tail)\n"),
+     "drafter-pad-rows", False)
 
 print("patched: " + ", ".join(done) + ("" if not warn else " | WARNING (optional, skipped): " + "; ".join(warn)))
 if fatal:
