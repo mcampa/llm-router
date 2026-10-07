@@ -16,14 +16,15 @@
 #   * points the fp8 n-gram table at the checkpoint's ple-table/, with its own map in
 #     /cache/ple-nvme-fp8 (~52G, built on the first boot of this backend).
 #
-# Two deliberate departures from the recipe, both required to sit behind this repo's
-# LiteLLM rather than myllmbox's own front end:
+# Two deliberate departures from the recipe, both required to sit behind this repo's own
+# LiteLLM and clients rather than myllmbox's front end:
 #
 #   * --served-model-name is qwen3.8-flash-next, not Qwen/Qwen3.8-Flash-Next, so the
 #     `local` alias and config.yaml are unchanged across a switch;
-#   * nothing else. In particular this does NOT pass --chat-template, so the checkpoint's
-#     own template applies and reasoning effort keeps the checkpoint's default. See the
-#     note before the serve line - that default is not the `medium` qwen38-fast uses.
+#   * --chat-template qwen38-fast-medium.jinja. The recipe passes none, so the checkpoint's
+#     own template applies - which rejects the two leading {role:system} blocks OpenCode and
+#     Hindsight emit (HTTP 400) and leaves reasoning effort off `medium`. See the note before
+#     the serve line.
 #
 # Mounted read-only at /workspace/vllm-start-myllmbox.sh. Compose sets
 # entrypoint: ["/bin/bash", "/workspace/vllm-start-myllmbox.sh"], which *replaces* the

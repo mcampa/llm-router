@@ -78,14 +78,11 @@ Expect ~10–15 minutes of weight loading. `qwen38-myllmbox` adds a one-time tab
 checkpoint; it lands under `cache/` and is reused afterwards, so that first start is the
 slowest of the three.
 
-> **Before promoting `qwen38-myllmbox` to the only backend**, note that unlike
-> `qwen38-fast` it passes no `--chat-template`, matching myllmbox's recipe exactly. The
-> checkpoint's own template then applies, which means two things this repo has otherwise
-> already handled: a harness that emits two leading system messages gets an HTTP 400 (the
-> case `qwen38-fast-medium.jinja` exists to merge), and reasoning effort keeps the
-> checkpoint's default rather than `medium`. Mount the template with `--chat-template`, or
-> pass `--default-chat-template-kwargs '{"reasoning_effort":"medium"}'`, before switching.
-> `vllm-start-myllmbox.sh` carries the same note at the serve line.
+> **`qwen38-myllmbox` passes `--chat-template qwen38-fast-medium.jinja`**, which its
+> upstream recipe does not. Without it the checkpoint's own template applies, and that
+> rejects the two leading `{role:system}` blocks OpenCode and Hindsight emit with an HTTP
+> 400 — the case the template exists to merge — while also leaving reasoning effort off
+> `medium`. Both are documented in `vllm-start-myllmbox.sh`.
 
 ## Model routes
 
